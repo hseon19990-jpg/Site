@@ -11,7 +11,20 @@ def init_db():
         username TEXT,
         messages_count INTEGER DEFAULT 0,
         is_banned INTEGER DEFAULT 0,
-        is_restricted INTEGER DEFAULT 0
+        is_restricted INTEGER DEFAULT 0,
+        gender TEXT
+    )''')
+    # ترحيل قواعد البيانات الموجودة قبل إضافة اختيار الجنس.
+    c.execute("PRAGMA table_info(users)")
+    user_columns = {row[1] for row in c.fetchall()}
+    if "gender" not in user_columns:
+        c.execute("ALTER TABLE users ADD COLUMN gender TEXT")
+    # ربط رسائل المشرف بالمستخدم حتى تعمل الردود على رسالة المحتوى أيضاً.
+    c.execute('''CREATE TABLE IF NOT EXISTS message_targets (
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        PRIMARY KEY (chat_id, message_id)
     )''')
     # جدول الإعدادات
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
@@ -68,6 +81,42 @@ def get_user(user_id):
     user = c.fetchone()
     conn.close()
     return user
+
+def get_user_gender(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT gender FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def set_user_gender(user_id, gender):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE users SET gender = ? WHERE user_id = ?", (gender, user_id))
+    conn.commit()
+    conn.close()
+
+def save_message_target(chat_id, message_id, user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO message_targets (chat_id, message_id, user_id) VALUES (?, ?, ?)",
+        (chat_id, message_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+def get_message_target(chat_id, message_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT user_id FROM message_targets WHERE chat_id = ? AND message_id = ?",
+        (chat_id, message_id),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 def set_user_status(user_id, status_type, value):
     conn = sqlite3.connect(DB_NAME)
