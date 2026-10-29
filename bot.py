@@ -1,7 +1,9 @@
 import logging
+import json
 import re
 from html import escape as html_escape
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ContextTypes, CallbackQueryHandler
@@ -15,6 +17,32 @@ from database import (
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+BUTTON_ICON_LABELS = {
+    "admin": "لوحة الإدارة",
+    "settings": "الإعدادات",
+    "moderation": "إدارة المستخدمين",
+    "stats": "الإحصائيات",
+    "broadcast": "البث",
+    "welcome": "تغيير رسالة الترحيب",
+    "ack": "تغيير رسالة التأكيد",
+    "back": "رجوع",
+}
+
+
+def admin_button(
+    text: str,
+    callback_data: str,
+    style: str = "primary",
+    icon_key=None,
+) -> InlineKeyboardButton:
+    """إنشاء زر لوحة الإدارة مع لون Telegram وأيقونة Premium اختيارية."""
+    kwargs = {"style": style}
+    if icon_key:
+        icon_id = get_setting(f"button_icon_{icon_key}")
+        if icon_id:
+            kwargs["icon_custom_emoji_id"] = icon_id
+    return InlineKeyboardButton(text, callback_data=callback_data, **kwargs)
 
 
 def extract_target_user_id(message_text: str) -> int:
@@ -46,17 +74,55 @@ async def send_configured_message(
     message_key: str,
     reply_markup=None,
 ):
-    """إرسال نص الرسالة الثابتة ثم إعادة توجيه ملصقها المحفوظ إن وجد."""
+    """إرسال النص بتنسيقه المحفوظ ثم إعادة توجيه ملصقه إن وجد."""
     text = get_setting(f"{message_key}_message") or ""
+    raw_entities = get_setting(f"{message_key}_entities")
     sticker_chat_id = get_setting(f"{message_key}_sticker_chat_id")
     sticker_message_id = get_setting(f"{message_key}_sticker_message_id")
 
+    if raw_entities is None and text:
+        # تنسيق أوضح للرسائل القديمة التي لم تكن تحفظ كيانات التنسيق.
+        text_length = len(text.encode("utf-16-le")) // 2
+        entities = [
+            MessageEntity(
+                type=MessageEntity.BOLD,
+                offset=0,
+                length=text_length,
+            )
+        ]
+    else:
+        try:
+            saved_entities = json.loads(raw_entities or "[]")
+            if not isinstance(saved_entities, list):
+                raise ValueError("قائمة الكيانات المحفوظة غير صالحة")
+            entities = [
+                MessageEntity.de_json(entity, context.bot)
+                for entity in saved_entities
+            ]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("تنسيق محفوظ غير صالح للرسالة الثابتة %s", message_key)
+            entities = []
+
     if text:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=reply_markup,
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                entities=entities or None,
+                reply_markup=reply_markup,
+            )
+        except BadRequest:
+            if not entities:
+                raise
+            logger.warning(
+                "تعذر إرسال تنسيق الرسالة %s؛ سيُرسل النص دون تنسيق",
+                message_key,
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
     elif reply_markup:
         await context.bot.send_message(
             chat_id=chat_id,
@@ -115,7 +181,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = None
     if is_owner(update):
         reply_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("👑 لوحة الإدارة", callback_data="open_admin_panel")
+            admin_button(
+                "👑 لوحة الإدارة",
+                callback_data="open_admin_panel",
+                icon_key="admin",
+            )
         ]])
     await send_configured_message(user.id, context, "welcome", reply_markup)
 
@@ -167,10 +237,20 @@ async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     keyboard = [
-        [InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")],
-        [InlineKeyboardButton("🛡 إدارة المستخدمين", callback_data="moderation_help")],
-        [InlineKeyboardButton("📊 إحصائيات", callback_data="stats")],
-        [InlineKeyboardButton("📢 إعداد رسالة عامة", callback_data="broadcast_setup")]
+        [admin_button("⚙️ الإعدادات", "settings", icon_key="settings")],
+        [admin_button(
+            "🛡 إدارة المستخدمين",
+            "moderation_help",
+            style="success",
+            icon_key="moderation",
+        )],
+        [admin_button(
+            "📊 إحصائيات",
+            "stats",
+            style="success",
+            icon_key="stats",
+        )],
+        [admin_button("📢 إعداد رسالة عامة", "broadcast_setup", icon_key="broadcast")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     if query:
@@ -186,13 +266,71 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     keyboard = [
-        [InlineKeyboardButton("✏️ تغيير رسالة الترحيب", callback_data="edit_welcome")],
-        [InlineKeyboardButton("✏️ تغيير رسالة التأكيد", callback_data="edit_ack")],
-        [InlineKeyboardButton("📢 تعيين القناة الإجبارية", callback_data="set_channel")],
-        [InlineKeyboardButton("🤖 تعيين البوت الإجباري", callback_data="set_bot")],
-        [InlineKeyboardButton("🔙 رجوع", callback_data="back_owner")]
+        [admin_button(
+            "✏️ تغيير رسالة الترحيب",
+            "edit_welcome",
+            icon_key="welcome",
+        )],
+        [admin_button(
+            "✏️ تغيير رسالة التأكيد",
+            "edit_ack",
+            icon_key="ack",
+        )],
+        [admin_button("📢 تعيين القناة الإجبارية", "set_channel")],
+        [admin_button("🤖 تعيين البوت الإجباري", "set_bot")],
+        [admin_button(
+            "🎨 تخصيص رموز الأزرار",
+            "button_icons",
+            style="success",
+        )],
+        [admin_button("🔙 رجوع", "back_owner", icon_key="back")]
     ]
     await query.edit_message_text("الإعدادات:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def button_icons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+
+    keyboard = [
+        [
+            admin_button(
+                f"✨ {label}",
+                f"set_button_icon:{key}",
+                icon_key=key,
+            )
+        ]
+        for key, label in BUTTON_ICON_LABELS.items()
+    ]
+    keyboard.append([
+        admin_button("🔙 رجوع للإعدادات", "settings", icon_key="settings")
+    ])
+    await query.edit_message_text(
+        "اختر الزر الذي تريد تخصيص أيقونته، ثم أرسل إيموجي Premium واحدًا. "
+        "لإزالة الأيقونة، أرسل كلمة «حذف».",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def set_button_icon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+
+    target = (query.data or "").partition(":")[2]
+    if target not in BUTTON_ICON_LABELS:
+        await query.answer("الزر غير معروف.", show_alert=True)
+        return
+
+    await query.answer()
+    context.user_data["expecting"] = "button_icon"
+    context.user_data["button_icon_target"] = target
+    await query.edit_message_text(
+        f"أرسل إيموجي Premium مخصصًا لأيقونة «{BUTTON_ICON_LABELS[target]}»، "
+        "أو أرسل «حذف» لإزالة الأيقونة الحالية."
+    )
 
 
 async def moderation_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,7 +338,7 @@ async def moderation_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await reject_non_owner_callback(update):
         return
     await query.answer()
-    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_owner")]]
+    keyboard = [[admin_button("🔙 رجوع", "back_owner", icon_key="back")]]
     text = (
         "🛡 إدارة المستخدمين\n\n"
         "للتحكم بمستخدم، ردّ على إشعار رسالته بأحد الأوامر:\n"
@@ -219,7 +357,7 @@ async def owner_stats_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await reject_non_owner_callback(update):
         return
     await query.answer()
-    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_owner")]]
+    keyboard = [[admin_button("🔙 رجوع", "back_owner", icon_key="back")]]
     await query.edit_message_text(
         f"📊 إحصائيات البوت\nالمستخدمون المسجلون: {len(get_all_users())}",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -232,7 +370,7 @@ async def broadcast_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     context.user_data["expecting"] = "broadcast"
-    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_owner")]]
+    keyboard = [[admin_button("🔙 رجوع", "back_owner", icon_key="back")]]
     await query.edit_message_text(
         "أرسل نص الرسالة العامة لحفظها. بعد الحفظ، أرسل /broadcast لإرسالها للمستخدمين.",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -401,7 +539,8 @@ async def edit_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     await query.edit_message_text(
-        "أرسل نص الترحيب لتحديثه، أو أرسل ملصقًا لإضافته إلى رسالة الترحيب."
+        "أرسل نص الترحيب مع التنسيق والإيموجي المخصص الذي تريده، "
+        "أو أرسل ملصقًا لإضافته إلى رسالة الترحيب."
     )
     context.user_data['expecting'] = 'welcome'
 
@@ -411,7 +550,8 @@ async def edit_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await query.answer()
     await query.edit_message_text(
-        "أرسل نص التأكيد لتحديثه، أو أرسل ملصقًا لإضافته إلى رسالة التأكيد."
+        "أرسل نص التأكيد مع التنسيق والإيموجي المخصص الذي تريده، "
+        "أو أرسل ملصقًا لإضافته إلى رسالة التأكيد."
     )
     context.user_data['expecting'] = 'ack'
 
@@ -439,6 +579,52 @@ async def handle_expecting_input(update: Update, context: ContextTypes.DEFAULT_T
     if not expecting:
         return
 
+    if expecting == "button_icon":
+        target = context.user_data.get("button_icon_target")
+        if target not in BUTTON_ICON_LABELS:
+            context.user_data.pop("expecting", None)
+            context.user_data.pop("button_icon_target", None)
+            await update.message.reply_text(
+                "❌ انتهت جلسة تخصيص الأيقونة. افتح إعدادات الأزرار وحاول مجددًا."
+            )
+            return
+
+        if (update.message.text or "").strip() in {"حذف", "إزالة", "مسح"}:
+            set_setting(f"button_icon_{target}", "")
+            context.user_data.pop("expecting", None)
+            context.user_data.pop("button_icon_target", None)
+            await update.message.reply_text(
+                f"✅ تمت إزالة أيقونة زر «{BUTTON_ICON_LABELS[target]}»."
+            )
+            return
+
+        custom_emoji = next(
+            (
+                entity
+                for entity in (update.message.entities or [])
+                if entity.type == MessageEntity.CUSTOM_EMOJI
+                and entity.custom_emoji_id
+            ),
+            None,
+        )
+        if custom_emoji:
+            set_setting(
+                f"button_icon_{target}",
+                custom_emoji.custom_emoji_id,
+            )
+            context.user_data.pop("expecting", None)
+            context.user_data.pop("button_icon_target", None)
+            await update.message.reply_text(
+                f"✅ تم حفظ أيقونة Premium لزر «{BUTTON_ICON_LABELS[target]}»."
+            )
+            return
+
+        await update.message.reply_text(
+            "لم أجد إيموجي Premium مخصصًا في رسالتك. أرسل إيموجي Premium واحدًا "
+            "أو أرسل «حذف» لإزالة الأيقونة."
+        )
+        return
+
     if expecting in ('welcome', 'ack') and update.message.sticker:
         set_setting(
             f"{expecting}_sticker_chat_id",
@@ -463,14 +649,32 @@ async def handle_expecting_input(update: Update, context: ContextTypes.DEFAULT_T
         return
     if expecting == 'welcome':
         set_setting("welcome_message", text)
+        set_setting(
+            "welcome_entities",
+            json.dumps(
+                [entity.to_dict() for entity in (update.message.entities or [])],
+                ensure_ascii=False,
+            ),
+        )
         set_setting("welcome_sticker_chat_id", "")
         set_setting("welcome_sticker_message_id", "")
-        await update.message.reply_text("✅ تم تحديث رسالة الترحيب.")
+        await update.message.reply_text(
+            "✅ تم تحديث رسالة الترحيب مع تنسيقها وإيموجيها المخصص."
+        )
     elif expecting == 'ack':
         set_setting("ack_message", text)
+        set_setting(
+            "ack_entities",
+            json.dumps(
+                [entity.to_dict() for entity in (update.message.entities or [])],
+                ensure_ascii=False,
+            ),
+        )
         set_setting("ack_sticker_chat_id", "")
         set_setting("ack_sticker_message_id", "")
-        await update.message.reply_text("✅ تم تحديث رسالة التأكيد.")
+        await update.message.reply_text(
+            "✅ تم تحديث رسالة التأكيد مع تنسيقها وإيموجيها المخصص."
+        )
     elif expecting == 'channel':
         set_setting("force_channel", text)
         await update.message.reply_text(f"✅ تم تعيين القناة الإجبارية: {text}")
@@ -547,6 +751,8 @@ def main():
     application.add_handler(CallbackQueryHandler(owner_stats_panel, pattern="^stats$"))
     application.add_handler(CallbackQueryHandler(broadcast_setup, pattern="^broadcast_setup$"))
     application.add_handler(CallbackQueryHandler(settings_menu, pattern="^settings$"))
+    application.add_handler(CallbackQueryHandler(button_icons_menu, pattern="^button_icons$"))
+    application.add_handler(CallbackQueryHandler(set_button_icon, pattern="^set_button_icon:"))
     application.add_handler(CallbackQueryHandler(moderation_help, pattern="^moderation_help$"))
     application.add_handler(CallbackQueryHandler(edit_welcome, pattern="^edit_welcome$"))
     application.add_handler(CallbackQueryHandler(edit_ack, pattern="^edit_ack$"))
