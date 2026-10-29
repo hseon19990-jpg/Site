@@ -40,6 +40,45 @@ async def reject_non_owner_callback(update: Update) -> bool:
     return True
 
 
+async def send_configured_message(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    message_key: str,
+    reply_markup=None,
+):
+    """إرسال نص الرسالة الثابتة ثم إعادة توجيه ملصقها المحفوظ إن وجد."""
+    text = get_setting(f"{message_key}_message") or ""
+    sticker_chat_id = get_setting(f"{message_key}_sticker_chat_id")
+    sticker_message_id = get_setting(f"{message_key}_sticker_message_id")
+
+    if text:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+    elif reply_markup:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="لوحة تحكم المالك:",
+            reply_markup=reply_markup,
+        )
+
+    if sticker_chat_id and sticker_message_id:
+        try:
+            await context.bot.forward_message(
+                chat_id=chat_id,
+                from_chat_id=int(sticker_chat_id),
+                message_id=int(sticker_message_id),
+            )
+        except Exception:
+            logger.exception("تعذّر إعادة توجيه ملصق الرسالة الثابتة %s", message_key)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="تعذّر إرسال الملصق المحفوظ.",
+            )
+
+
 async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """التحقق من الاشتراك في القناة والبوت الإجباري"""
     user_id = update.effective_user.id
@@ -73,13 +112,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_subscribed(update, context):
         return
     
-    welcome = get_setting("welcome_message")
     reply_markup = None
     if is_owner(update):
         reply_markup = InlineKeyboardMarkup([[
             InlineKeyboardButton("👑 لوحة الإدارة", callback_data="open_admin_panel")
         ]])
-    await update.message.reply_text(welcome, reply_markup=reply_markup)
+    await send_configured_message(user.id, context, "welcome", reply_markup)
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -116,9 +154,8 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode=ParseMode.HTML,
     )
     
-    # الرد على المستخدم برسالة التأكيد
-    ack = get_setting("ack_message")
-    await update.message.reply_text(ack)
+    # إرسال رسالة التأكيد والملصق المحفوظ معها إن وجد.
+    await send_configured_message(user.id, context, "ack")
 
 # --- أوامر المالك ---
 
@@ -206,6 +243,19 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """عندما يرد المالك على رسالة، تصل للمستخدم الأصلي"""
     if update.effective_user.id != config.OWNER_ID:
         return
+
+    expecting = context.user_data.get("expecting")
+    if expecting and update.message.reply_to_message:
+        try:
+            extract_target_user_id(
+                update.message.reply_to_message.text
+                or update.message.reply_to_message.caption
+                or ""
+            )
+        except ValueError:
+            await handle_expecting_input(update, context)
+            return
+
     if not update.message.reply_to_message:
         await handle_expecting_input(update, context)
         return
@@ -223,7 +273,17 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     try:
-        await context.bot.send_message(chat_id=target_id, text=update.message.text)
+        if update.message.text is not None:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=update.message.text,
+            )
+        else:
+            await context.bot.forward_message(
+                chat_id=target_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+            )
     except Exception:
         logger.exception("تعذّر إرسال رد المالك إلى المستخدم %s", target_id)
         await update.message.reply_text(
@@ -340,7 +400,9 @@ async def edit_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await reject_non_owner_callback(update):
         return
     await query.answer()
-    await query.edit_message_text("أرسل رسالة الترحيب الجديدة:")
+    await query.edit_message_text(
+        "أرسل نص الترحيب لتحديثه، أو أرسل ملصقًا لإضافته إلى رسالة الترحيب."
+    )
     context.user_data['expecting'] = 'welcome'
 
 async def edit_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -348,7 +410,9 @@ async def edit_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await reject_non_owner_callback(update):
         return
     await query.answer()
-    await query.edit_message_text("أرسل رسالة التأكيد الجديدة:")
+    await query.edit_message_text(
+        "أرسل نص التأكيد لتحديثه، أو أرسل ملصقًا لإضافته إلى رسالة التأكيد."
+    )
     context.user_data['expecting'] = 'ack'
 
 async def set_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -374,13 +438,38 @@ async def handle_expecting_input(update: Update, context: ContextTypes.DEFAULT_T
     expecting = context.user_data.get('expecting')
     if not expecting:
         return
+
+    if expecting in ('welcome', 'ack') and update.message.sticker:
+        set_setting(
+            f"{expecting}_sticker_chat_id",
+            str(update.effective_chat.id),
+        )
+        set_setting(
+            f"{expecting}_sticker_message_id",
+            str(update.message.message_id),
+        )
+        label = "الترحيب" if expecting == "welcome" else "التأكيد"
+        await update.message.reply_text(
+            f"✅ تمت إضافة الملصق إلى رسالة {label}، وسيعيد البوت توجيه الملصق الأصلي."
+        )
+        del context.user_data['expecting']
+        return
     
     text = update.message.text
+    if text is None:
+        await update.message.reply_text(
+            "أرسل نصًا، أو أرسل ملصقًا عند تعديل رسالة الترحيب أو التأكيد."
+        )
+        return
     if expecting == 'welcome':
         set_setting("welcome_message", text)
+        set_setting("welcome_sticker_chat_id", "")
+        set_setting("welcome_sticker_message_id", "")
         await update.message.reply_text("✅ تم تحديث رسالة الترحيب.")
     elif expecting == 'ack':
         set_setting("ack_message", text)
+        set_setting("ack_sticker_chat_id", "")
+        set_setting("ack_sticker_message_id", "")
         await update.message.reply_text("✅ تم تحديث رسالة التأكيد.")
     elif expecting == 'channel':
         set_setting("force_channel", text)
@@ -435,7 +524,12 @@ def main():
         & filters.Regex(r"(?i)^\s*(?:/admin(?:@\w+)?|ادمن|أدمن)\s*$"),
         owner_panel,
     ))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(config.OWNER_ID), handle_owner_reply))
+    application.add_handler(MessageHandler(
+        filters.ALL
+        & ~filters.COMMAND
+        & filters.User(config.OWNER_ID),
+        handle_owner_reply,
+    ))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_user_message))
     
     # أوامر المالك
