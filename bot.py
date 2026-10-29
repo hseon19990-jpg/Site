@@ -280,10 +280,10 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         text=owner_msg,
         parse_mode=ParseMode.HTML,
     )
-    gendered_label = "الحلو" if gender == "male" else "الحلوة"
+    gendered_label = "رسالة الولد" if gender == "male" else "رسالة الاميرة"
     sender_message = await context.bot.send_message(
         chat_id=config.OWNER_ID,
-        text=f"<b>رسالة من {gendered_label}:</b>\n{html_escape(update.message.text)}",
+        text=f"<b>{gendered_label}:</b>\n{html_escape(update.message.text)}",
         parse_mode=ParseMode.HTML,
         reply_parameters=ReplyParameters(message_id=sender_info.message_id),
     )
