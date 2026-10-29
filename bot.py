@@ -1,10 +1,10 @@
 import logging
+import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ContextTypes, CallbackQueryHandler
 )
-from telegram.constants import ParseMode
 import config
 from database import (
     init_db, get_setting, set_setting, add_user, increment_message_count,
@@ -12,6 +12,19 @@ from database import (
 )
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def extract_target_user_id(message_text: str) -> int:
+    """استخراج معرّف المستخدم من إشعار المالك قبل أو بعد معالجة Markdown."""
+    match = re.search(
+        r"(?m)^\s*🆔\s*(?:الأيدي|ID)\s*:\s*`?(\d+)`?\s*$",
+        message_text or "",
+    )
+    if not match:
+        raise ValueError("لم يتم العثور على أيدي المستخدم في الرسالة.")
+    return int(match.group(1))
+
 
 async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """التحقق من الاشتراك في القناة والبوت الإجباري"""
@@ -67,14 +80,15 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     increment_message_count(user.id)
     count = get_user(user.id)[3]
     
-    # إرسال الرسالة إلى المالك مع رابط فتح الدردشة
-    sender_link = f"[{user.full_name}](tg://openmessage?user_id={user.id})"
-    owner_msg = f"📩 رسالة جديدة من: {sender_link}\n"
-    owner_msg += f"🆔 الأيدي: `{user.id}`\n"
+    # أبقِ إشعار المالك نصاً عادياً حتى لا تكسر الأسماء أو الرسائل تنسيق Markdown.
+    owner_msg = f"🆔 الأيدي: {user.id}\n"
+    owner_msg += f"📩 رسالة جديدة من: {user.full_name}\n"
+    if user.username:
+        owner_msg += f"👤 اسم المستخدم: @{user.username}\n"
     owner_msg += f"📊 عدد الرسائل: {count}\n"
     owner_msg += f"💬 النص:\n{update.message.text}"
-    
-    await context.bot.send_message(chat_id=config.OWNER_ID, text=owner_msg, parse_mode=ParseMode.MARKDOWN)
+
+    await context.bot.send_message(chat_id=config.OWNER_ID, text=owner_msg)
     
     # الرد على المستخدم برسالة التأكيد
     ack = get_setting("ack_message")
@@ -114,18 +128,27 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     
     original_msg = update.message.reply_to_message
-    # استخراج أيدي المستخدم من نص الرسالة الأصلية
     try:
-        # البحث عن "الأيدي: `123456`"
-        text = original_msg.text
-        start = text.find("الأيدي: `") + len("الأيدي: `")
-        end = text.find("`", start)
-        target_id = int(text[start:end])
-        
+        target_id = extract_target_user_id(
+            original_msg.text or original_msg.caption or ""
+        )
+    except ValueError:
+        await update.message.reply_text(
+            "❌ لم أجد أيدي المستخدم في الرسالة التي رددت عليها. "
+            "ردّ على إشعار رسالة المستخدم الذي أرسله البوت."
+        )
+        return
+
+    try:
         await context.bot.send_message(chat_id=target_id, text=update.message.text)
-        await update.message.reply_text("✅ تم إرسال الرد للمستخدم.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطأ في استخراج الأيدي: {e}")
+    except Exception:
+        logger.exception("تعذّر إرسال رد المالك إلى المستخدم %s", target_id)
+        await update.message.reply_text(
+            "❌ تعذّر إرسال الرد للمستخدم. قد يكون قد حظر البوت أو أوقف المحادثة."
+        )
+        return
+
+    await update.message.reply_text("✅ تم إرسال الرد للمستخدم.")
 
 # --- أوامر الحظر والتقييد ---
 
