@@ -1,10 +1,12 @@
 import logging
 import re
+from html import escape as html_escape
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ContextTypes, CallbackQueryHandler
 )
+from telegram.constants import ParseMode
 import config
 from database import (
     init_db, get_setting, set_setting, add_user, increment_message_count,
@@ -16,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 def extract_target_user_id(message_text: str) -> int:
-    """استخراج معرّف المستخدم من إشعار المالك قبل أو بعد معالجة Markdown."""
+    """استخراج معرّف المستخدم بعد إزالة Telegram لوسوم التنسيق."""
     match = re.search(
         r"(?m)^\s*🆔\s*(?:الأيدي|ID)\s*:\s*`?(\d+)`?\s*$",
         message_text or "",
@@ -80,15 +82,22 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     increment_message_count(user.id)
     count = get_user(user.id)[3]
     
-    # أبقِ إشعار المالك نصاً عادياً حتى لا تكسر الأسماء أو الرسائل تنسيق Markdown.
-    owner_msg = f"🆔 الأيدي: {user.id}\n"
-    owner_msg += f"📩 رسالة جديدة من: {user.full_name}\n"
+    # استخدم HTML مع تهريب النصوص حتى يبقى الاسم رابطاً آمناً والرسالة كما كتبها المستخدم.
+    owner_msg = f"🆔 الأيدي: <code>{user.id}</code>\n"
+    owner_msg += (
+        f'📩 رسالة جديدة من: <a href="tg://openmessage?user_id={user.id}">'
+        f"{html_escape(user.full_name)}</a>\n"
+    )
     if user.username:
-        owner_msg += f"👤 اسم المستخدم: @{user.username}\n"
+        owner_msg += f"👤 اسم المستخدم: @{html_escape(user.username)}\n"
     owner_msg += f"📊 عدد الرسائل: {count}\n"
-    owner_msg += f"💬 النص:\n{update.message.text}"
+    owner_msg += f"💬 النص:\n{html_escape(update.message.text)}"
 
-    await context.bot.send_message(chat_id=config.OWNER_ID, text=owner_msg)
+    await context.bot.send_message(
+        chat_id=config.OWNER_ID,
+        text=owner_msg,
+        parse_mode=ParseMode.HTML,
+    )
     
     # الرد على المستخدم برسالة التأكيد
     ack = get_setting("ack_message")
@@ -160,10 +169,11 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        text = update.message.reply_to_message.text
-        start = text.find("الأيدي: `") + len("الأيدي: `")
-        end = text.find("`", start)
-        target_id = int(text[start:end])
+        target_id = extract_target_user_id(
+            update.message.reply_to_message.text
+            or update.message.reply_to_message.caption
+            or ""
+        )
         
         set_user_status(target_id, "ban", 1)
         await update.message.reply_text(f"✅ تم حظر المستخدم `{target_id}`.")
@@ -178,10 +188,11 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        text = update.message.reply_to_message.text
-        start = text.find("الأيدي: `") + len("الأيدي: `")
-        end = text.find("`", start)
-        target_id = int(text[start:end])
+        target_id = extract_target_user_id(
+            update.message.reply_to_message.text
+            or update.message.reply_to_message.caption
+            or ""
+        )
         
         set_user_status(target_id, "ban", 0)
         await update.message.reply_text(f"✅ تم رفع الحظر عن `{target_id}`.")
@@ -196,10 +207,11 @@ async def restrict_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        text = update.message.reply_to_message.text
-        start = text.find("الأيدي: `") + len("الأيدي: `")
-        end = text.find("`", start)
-        target_id = int(text[start:end])
+        target_id = extract_target_user_id(
+            update.message.reply_to_message.text
+            or update.message.reply_to_message.caption
+            or ""
+        )
         
         set_user_status(target_id, "restrict", 1)
         await update.message.reply_text(f"✅ تم تقييد المستخدم `{target_id}`.")
@@ -214,10 +226,11 @@ async def unrestrict_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        text = update.message.reply_to_message.text
-        start = text.find("الأيدي: `") + len("الأيدي: `")
-        end = text.find("`", start)
-        target_id = int(text[start:end])
+        target_id = extract_target_user_id(
+            update.message.reply_to_message.text
+            or update.message.reply_to_message.caption
+            or ""
+        )
         
         set_user_status(target_id, "restrict", 0)
         await update.message.reply_text(f"✅ تم رفع التقييد عن `{target_id}`.")
@@ -232,10 +245,11 @@ async def user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        text = update.message.reply_to_message.text
-        start = text.find("الأيدي: `") + len("الأيدي: `")
-        end = text.find("`", start)
-        target_id = int(text[start:end])
+        target_id = extract_target_user_id(
+            update.message.reply_to_message.text
+            or update.message.reply_to_message.caption
+            or ""
+        )
         
         user = get_user(target_id)
         if user:
