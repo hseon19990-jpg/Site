@@ -74,7 +74,11 @@ def get_target_user_id_from_message(message) -> int:
 def gender_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("ذكر", callback_data="set_gender:male"),
-        InlineKeyboardButton("أنثى", callback_data="set_gender:female"),
+        InlineKeyboardButton(
+            "أنثى",
+            callback_data="set_gender:female",
+            style="danger",
+        ),
     ]])
 
 
@@ -83,6 +87,47 @@ async def prompt_for_gender(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat_id,
         text="قبل إرسال الرسائل، اختر الجنس من الأزرار:",
         reply_markup=gender_keyboard(),
+    )
+
+
+async def notify_new_group_members(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    members = [
+        member
+        for member in (message.new_chat_members or [])
+        if member.id != context.bot.id
+    ]
+    if not members:
+        return
+
+    group_title = html_escape((chat.title or str(chat.id)).replace("\n", " "))
+    member_lines = []
+    for member in members:
+        name = html_escape(member.full_name.replace("\n", " "))
+        username = (
+            f"@{html_escape(member.username)}"
+            if member.username
+            else "بدون اسم مستخدم"
+        )
+        member_lines.append(
+            f"• {name} ({username}) — <code>{member.id}</code>"
+        )
+
+    await context.bot.send_message(
+        chat_id=config.OWNER_ID,
+        text=(
+            f"🔔 انضم عضو جديد إلى المجموعة <b>{group_title}</b>:\n"
+            + "\n".join(member_lines)
+        ),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
 
 
@@ -765,6 +810,10 @@ def main():
     # أوامر المستخدم
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", owner_panel))
+    application.add_handler(MessageHandler(
+        filters.StatusUpdate.NEW_CHAT_MEMBERS & filters.ChatType.GROUPS,
+        notify_new_group_members,
+    ))
     application.add_handler(MessageHandler(
         filters.TEXT
         & filters.User(config.OWNER_ID)
