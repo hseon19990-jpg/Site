@@ -28,6 +28,18 @@ def extract_target_user_id(message_text: str) -> int:
     return int(match.group(1))
 
 
+def is_owner(update: Update) -> bool:
+    user = update.effective_user
+    return user is not None and user.id == config.OWNER_ID
+
+
+async def reject_non_owner_callback(update: Update) -> bool:
+    if is_owner(update):
+        return False
+    await update.callback_query.answer("هذه اللوحة للمالك فقط.", show_alert=True)
+    return True
+
+
 async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """التحقق من الاشتراك في القناة والبوت الإجباري"""
     user_id = update.effective_user.id
@@ -62,7 +74,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     welcome = get_setting("welcome_message")
-    await update.message.reply_text(welcome)
+    reply_markup = None
+    if is_owner(update):
+        reply_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("👑 لوحة الإدارة", callback_data="open_admin_panel")
+        ]])
+    await update.message.reply_text(welcome, reply_markup=reply_markup)
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -106,18 +123,29 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 # --- أوامر المالك ---
 
 async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != config.OWNER_ID:
+    query = update.callback_query
+    if not is_owner(update):
+        if query:
+            await query.answer("هذه اللوحة للمالك فقط.", show_alert=True)
         return
     
     keyboard = [
         [InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings")],
+        [InlineKeyboardButton("🛡 إدارة المستخدمين", callback_data="moderation_help")],
         [InlineKeyboardButton("📊 إحصائيات", callback_data="stats")],
-        [InlineKeyboardButton("📢 رسالة عامة", callback_data="broadcast")]
+        [InlineKeyboardButton("📢 إعداد رسالة عامة", callback_data="broadcast_setup")]
     ]
-    await update.message.reply_text("لوحة تحكم المالك:", reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if query:
+        await query.answer()
+        await query.edit_message_text("لوحة تحكم المالك:", reply_markup=reply_markup)
+    elif update.message:
+        await update.message.reply_text("لوحة تحكم المالك:", reply_markup=reply_markup)
 
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
     await query.answer()
     
     keyboard = [
@@ -129,11 +157,57 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await query.edit_message_text("الإعدادات:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+
+async def moderation_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_owner")]]
+    text = (
+        "🛡 إدارة المستخدمين\n\n"
+        "للتحكم بمستخدم، ردّ على إشعار رسالته بأحد الأوامر:\n"
+        "/ban — حظر\n"
+        "/unban — رفع الحظر\n"
+        "/restrict — تقييد\n"
+        "/unrestrict — رفع التقييد\n"
+        "/stats — عرض الإحصائيات\n\n"
+        "هذه الأوامر متاحة للمالك فقط."
+    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def owner_stats_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_owner")]]
+    await query.edit_message_text(
+        f"📊 إحصائيات البوت\nالمستخدمون المسجلون: {len(get_all_users())}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def broadcast_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    context.user_data["expecting"] = "broadcast"
+    keyboard = [[InlineKeyboardButton("🔙 رجوع", callback_data="back_owner")]]
+    await query.edit_message_text(
+        "أرسل نص الرسالة العامة لحفظها. بعد الحفظ، أرسل /broadcast لإرسالها للمستخدمين.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
 async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """عندما يرد المالك على رسالة، تصل للمستخدم الأصلي"""
     if update.effective_user.id != config.OWNER_ID:
         return
     if not update.message.reply_to_message:
+        await handle_expecting_input(update, context)
         return
     
     original_msg = update.message.reply_to_message
@@ -263,24 +337,32 @@ async def user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def edit_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
     await query.answer()
     await query.edit_message_text("أرسل رسالة الترحيب الجديدة:")
     context.user_data['expecting'] = 'welcome'
 
 async def edit_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
     await query.answer()
     await query.edit_message_text("أرسل رسالة التأكيد الجديدة:")
     context.user_data['expecting'] = 'ack'
 
 async def set_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
     await query.answer()
     await query.edit_message_text("أرسل معرف القناة (مثال: @channelusername) أو أيديها:")
     context.user_data['expecting'] = 'channel'
 
 async def set_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
     await query.answer()
     await query.edit_message_text("أرسل معرف البوت الإجباري (مثال: @botusername):")
     context.user_data['expecting'] = 'bot'
@@ -306,6 +388,11 @@ async def handle_expecting_input(update: Update, context: ContextTypes.DEFAULT_T
     elif expecting == 'bot':
         set_setting("force_bot", text)
         await update.message.reply_text(f"✅ تم تعيين البوت الإجباري: {text}")
+    elif expecting == 'broadcast':
+        set_setting("broadcast_text", text)
+        await update.message.reply_text(
+            "✅ تم حفظ الرسالة العامة. لإرسالها إلى المستخدمين، أرسل /broadcast."
+        )
     
     del context.user_data['expecting']
 
@@ -341,6 +428,13 @@ def main():
     
     # أوامر المستخدم
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("admin", owner_panel))
+    application.add_handler(MessageHandler(
+        filters.TEXT
+        & filters.User(config.OWNER_ID)
+        & filters.Regex(r"(?i)^\s*(?:/admin(?:@\w+)?|ادمن|أدمن)\s*$"),
+        owner_panel,
+    ))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(config.OWNER_ID), handle_owner_reply))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_user_message))
     
@@ -355,14 +449,15 @@ def main():
     application.add_handler(CommandHandler("broadcast", broadcast))
     
     # أزرار لوحة التحكم
+    application.add_handler(CallbackQueryHandler(owner_panel, pattern="^(?:open_admin_panel|back_owner)$"))
+    application.add_handler(CallbackQueryHandler(owner_stats_panel, pattern="^stats$"))
+    application.add_handler(CallbackQueryHandler(broadcast_setup, pattern="^broadcast_setup$"))
     application.add_handler(CallbackQueryHandler(settings_menu, pattern="^settings$"))
+    application.add_handler(CallbackQueryHandler(moderation_help, pattern="^moderation_help$"))
     application.add_handler(CallbackQueryHandler(edit_welcome, pattern="^edit_welcome$"))
     application.add_handler(CallbackQueryHandler(edit_ack, pattern="^edit_ack$"))
     application.add_handler(CallbackQueryHandler(set_channel, pattern="^set_channel$"))
     application.add_handler(CallbackQueryHandler(set_bot, pattern="^set_bot$"))
-    
-    # معالجة إدخالات المالك (يجب أن تكون بعد الأوامر)
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.User(config.OWNER_ID), handle_expecting_input))
     
     print("البوت يعمل الآن...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
