@@ -12,13 +12,16 @@ def init_db():
         messages_count INTEGER DEFAULT 0,
         is_banned INTEGER DEFAULT 0,
         is_restricted INTEGER DEFAULT 0,
-        gender TEXT
+        gender TEXT,
+        start_notified INTEGER DEFAULT 0
     )''')
     # ترحيل قواعد البيانات الموجودة قبل إضافة اختيار الجنس.
     c.execute("PRAGMA table_info(users)")
     user_columns = {row[1] for row in c.fetchall()}
     if "gender" not in user_columns:
         c.execute("ALTER TABLE users ADD COLUMN gender TEXT")
+    if "start_notified" not in user_columns:
+        c.execute("ALTER TABLE users ADD COLUMN start_notified INTEGER DEFAULT 0")
     # ربط رسائل المشرف بالمستخدم حتى تعمل الردود على رسالة المحتوى أيضاً.
     c.execute('''CREATE TABLE IF NOT EXISTS message_targets (
         chat_id INTEGER NOT NULL,
@@ -66,6 +69,19 @@ def add_user(user_id, full_name, username):
     c.execute("UPDATE users SET full_name = ?, username = ? WHERE user_id = ?", (full_name, username, user_id))
     conn.commit()
     conn.close()
+
+def mark_user_start_notified(user_id):
+    """يرجع True مرة واحدة فقط عند أول أمر /start لهذا المستخدم."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE users SET start_notified = 1 WHERE user_id = ? AND start_notified = 0",
+        (user_id,),
+    )
+    is_first_start = c.rowcount == 1
+    conn.commit()
+    conn.close()
+    return is_first_start
 
 def increment_message_count(user_id):
     conn = sqlite3.connect(DB_NAME)
