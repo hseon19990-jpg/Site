@@ -14,9 +14,9 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 import config
 from database import (
-    init_db, get_setting, set_setting, add_user, increment_message_count,
-    get_user, set_user_status, get_all_users, get_user_gender,
-    set_user_gender, save_message_target, get_message_target,
+    init_db, get_setting, set_setting, add_user, mark_user_start_notified,
+    increment_message_count, get_user, set_user_status, get_all_users,
+    get_user_gender, set_user_gender, save_message_target, get_message_target,
 )
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -249,7 +249,24 @@ async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     add_user(user.id, user.full_name, user.username)
-    
+
+    if user.id != config.OWNER_ID and mark_user_start_notified(user.id):
+        owner_message = (
+            "🔔 <b>دخول عضو جديد لأول مرة</b>\n"
+            f"👤 الاسم: {html_escape(user.full_name)}\n"
+        )
+        if user.username:
+            owner_message += f"🔗 اسم المستخدم: @{html_escape(user.username)}\n"
+        owner_message += f"🆔 الأيدي: <code>{user.id}</code>"
+        try:
+            await context.bot.send_message(
+                chat_id=config.OWNER_ID,
+                text=owner_message,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            logger.exception("تعذّر إرسال إشعار أول دخول إلى المالك")
+
     if not await is_subscribed(update, context):
         return
     
