@@ -2,7 +2,10 @@ import logging
 import json
 import re
 from html import escape as html_escape
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity,
+    ReplyParameters,
+)
 from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -12,7 +15,8 @@ from telegram.constants import ParseMode
 import config
 from database import (
     init_db, get_setting, set_setting, add_user, increment_message_count,
-    get_user, set_user_status, get_all_users
+    get_user, set_user_status, get_all_users, get_user_gender,
+    set_user_gender, save_message_target, get_message_target,
 )
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -54,6 +58,32 @@ def extract_target_user_id(message_text: str) -> int:
     if not match:
         raise ValueError("لم يتم العثور على أيدي المستخدم في الرسالة.")
     return int(match.group(1))
+
+
+def get_target_user_id_from_message(message) -> int:
+    """استخراج المستخدم من بطاقة المعلومات أو من رسالة المحتوى المرتبطة بها."""
+    try:
+        return extract_target_user_id(message.text or message.caption or "")
+    except ValueError:
+        target_id = get_message_target(message.chat_id, message.message_id)
+        if target_id is None:
+            raise
+        return target_id
+
+
+def gender_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("ذكر", callback_data="set_gender:male"),
+        InlineKeyboardButton("أنثى", callback_data="set_gender:female"),
+    ]])
+
+
+async def prompt_for_gender(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="قبل إرسال الرسائل، اختر الجنس من الأزرار:",
+        reply_markup=gender_keyboard(),
+    )
 
 
 def is_owner(update: Update) -> bool:
@@ -188,6 +218,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         ]])
     await send_configured_message(user.id, context, "welcome", reply_markup)
+    if not is_owner(update) and get_user_gender(user.id) is None:
+        await prompt_for_gender(user.id, context)
+
+
+async def set_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    gender = (query.data or "").partition(":")[2]
+    if user is None or gender not in {"male", "female"}:
+        await query.answer("الاختيار غير صالح.", show_alert=True)
+        return
+
+    add_user(user.id, user.full_name, user.username)
+    set_user_gender(user.id, gender)
+    await query.answer("تم حفظ اختيارك.")
+    await context.bot.send_message(
+        chat_id=user.id,
+        text="تم حفظ اختيارك. يمكنك الآن إرسال رسالتك.",
+    )
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -203,6 +252,14 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user_data and user_data[5] == 1:  # is_restricted
         await update.message.reply_text("أنت مقيد من إرسال الرسائل.")
         return
+
+    gender = get_user_gender(user.id)
+    if gender not in {"male", "female"}:
+        await update.message.reply_text(
+            "اختر الجنس أولاً من الأزرار، ثم أعد إرسال رسالتك:",
+            reply_markup=gender_keyboard(),
+        )
+        return
     
     increment_message_count(user.id)
     count = get_user(user.id)[3]
@@ -216,12 +273,24 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user.username:
         owner_msg += f"👤 اسم المستخدم: @{html_escape(user.username)}\n"
     owner_msg += f"📊 عدد الرسائل: {count}\n"
-    owner_msg += f"💬 النص:\n{html_escape(update.message.text)}"
+    owner_msg += f"⚧ الجنس: {'ذكر' if gender == 'male' else 'أنثى'}"
 
-    await context.bot.send_message(
+    sender_info = await context.bot.send_message(
         chat_id=config.OWNER_ID,
         text=owner_msg,
         parse_mode=ParseMode.HTML,
+    )
+    gendered_label = "رسالة الولد" if gender == "male" else "رسالة الاميرة"
+    sender_message = await context.bot.send_message(
+        chat_id=config.OWNER_ID,
+        text=f"<b>{gendered_label}:</b>\n{html_escape(update.message.text)}",
+        parse_mode=ParseMode.HTML,
+        reply_parameters=ReplyParameters(message_id=sender_info.message_id),
+    )
+    save_message_target(
+        config.OWNER_ID,
+        sender_message.message_id,
+        user.id,
     )
     
     # إرسال رسالة التأكيد والملصق المحفوظ معها إن وجد.
@@ -385,11 +454,7 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     expecting = context.user_data.get("expecting")
     if expecting and update.message.reply_to_message:
         try:
-            extract_target_user_id(
-                update.message.reply_to_message.text
-                or update.message.reply_to_message.caption
-                or ""
-            )
+            get_target_user_id_from_message(update.message.reply_to_message)
         except ValueError:
             await handle_expecting_input(update, context)
             return
@@ -400,9 +465,7 @@ async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     original_msg = update.message.reply_to_message
     try:
-        target_id = extract_target_user_id(
-            original_msg.text or original_msg.caption or ""
-        )
+        target_id = get_target_user_id_from_message(original_msg)
     except ValueError:
         await update.message.reply_text(
             "❌ لم أجد أيدي المستخدم في الرسالة التي رددت عليها. "
@@ -441,11 +504,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        target_id = extract_target_user_id(
-            update.message.reply_to_message.text
-            or update.message.reply_to_message.caption
-            or ""
-        )
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
         
         set_user_status(target_id, "ban", 1)
         await update.message.reply_text(f"✅ تم حظر المستخدم `{target_id}`.")
@@ -460,11 +519,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        target_id = extract_target_user_id(
-            update.message.reply_to_message.text
-            or update.message.reply_to_message.caption
-            or ""
-        )
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
         
         set_user_status(target_id, "ban", 0)
         await update.message.reply_text(f"✅ تم رفع الحظر عن `{target_id}`.")
@@ -479,11 +534,7 @@ async def restrict_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        target_id = extract_target_user_id(
-            update.message.reply_to_message.text
-            or update.message.reply_to_message.caption
-            or ""
-        )
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
         
         set_user_status(target_id, "restrict", 1)
         await update.message.reply_text(f"✅ تم تقييد المستخدم `{target_id}`.")
@@ -498,11 +549,7 @@ async def unrestrict_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        target_id = extract_target_user_id(
-            update.message.reply_to_message.text
-            or update.message.reply_to_message.caption
-            or ""
-        )
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
         
         set_user_status(target_id, "restrict", 0)
         await update.message.reply_text(f"✅ تم رفع التقييد عن `{target_id}`.")
@@ -517,11 +564,7 @@ async def user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        target_id = extract_target_user_id(
-            update.message.reply_to_message.text
-            or update.message.reply_to_message.caption
-            or ""
-        )
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
         
         user = get_user(target_id)
         if user:
@@ -748,6 +791,7 @@ def main():
     
     # أزرار لوحة التحكم
     application.add_handler(CallbackQueryHandler(owner_panel, pattern="^(?:open_admin_panel|back_owner)$"))
+    application.add_handler(CallbackQueryHandler(set_gender, pattern="^set_gender:"))
     application.add_handler(CallbackQueryHandler(owner_stats_panel, pattern="^stats$"))
     application.add_handler(CallbackQueryHandler(broadcast_setup, pattern="^broadcast_setup$"))
     application.add_handler(CallbackQueryHandler(settings_menu, pattern="^settings$"))
