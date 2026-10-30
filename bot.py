@@ -9,7 +9,7 @@ from telegram import (
 from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, CallbackQueryHandler
+    ContextTypes, CallbackQueryHandler, TypeHandler
 )
 from telegram.constants import ParseMode
 import config
@@ -17,10 +17,17 @@ from database import (
     init_db, get_setting, set_setting, add_user, mark_user_start_notified,
     increment_message_count, get_user, set_user_status, get_all_users,
     get_user_gender, set_user_gender, save_message_target, get_message_target,
+    save_business_connection, get_business_connection,
+    count_active_business_connections, save_business_message_metadata,
+    get_business_message_metadata, delete_business_message_metadata,
+    delete_business_message_metadata_for_connection,
+    prune_business_message_metadata,
 )
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+BUSINESS_METADATA_RETENTION_DAYS = 30
+BUSINESS_MESSAGE_MAX_CHARS = 3000
 
 BUTTON_ICON_LABELS = {
     "admin": "لوحة الإدارة",
@@ -31,6 +38,7 @@ BUTTON_ICON_LABELS = {
     "welcome": "تغيير رسالة الترحيب",
     "ack": "تغيير رسالة التأكيد",
     "back": "رجوع",
+    "business": "ربط Telegram Business",
 }
 
 
@@ -381,6 +389,12 @@ async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             style="success",
             icon_key="stats",
         )],
+        [admin_button(
+            "🔗 ربط Telegram Business",
+            "business_link",
+            style="success",
+            icon_key="business",
+        )],
         [admin_button("📢 إعداد رسالة عامة", "broadcast_setup", icon_key="broadcast")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -417,6 +431,224 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [admin_button("🔙 رجوع", "back_owner", icon_key="back")]
     ]
     await query.edit_message_text("الإعدادات:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+
+async def business_link_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض خطوات الربط الرسمي وحالة اتصال Telegram Business للمالك فقط."""
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+
+    active_connections = count_active_business_connections(config.OWNER_ID)
+    if active_connections:
+        status_text = f"✅ يوجد اتصال نشط ({active_connections})."
+    else:
+        status_text = "⚪ لا يوجد اتصال Business نشط مسجل حتى الآن."
+
+    text = (
+        "🔗 ربط Telegram Business\n\n"
+        f"الحالة: {status_text}\n\n"
+        "الربط يتم داخل تطبيق Telegram، وليس عبر إدخال رمز دخول في البوت:\n"
+        "1) افتح Telegram > الإعدادات > Telegram Business / الأعمال.\n"
+        "2) افتح Chatbots / روبوتات المحادثة واختر هذا البوت.\n"
+        "3) إذا تريده لكل الناس، فعّل كل فئات المحادثات الخاصة المتاحة: القديمة والجديدة، "
+        "جهات الاتصال وغير جهات الاتصال، ولا تستثنِ أفرادًا. امنحه أقل الصلاحيات المعروضة. "
+        "لا تمنحه صلاحية الرد أو الحذف أو إدارة القصص لهذا التنبيه.\n"
+        "4) ارجع إلى هنا واضغط «تحديث حالة الربط». سيصل تأكيد عند استلام Telegram للاتصال.\n\n"
+        "🔒 الخصوصية: البوت يرسل للمالك إشعارًا بالرسالة الجديدة أو تعديلها. "
+        "لا يخزّن نص الرسالة في قاعدة بياناته؛ يحتفظ بمعرّف الرسالة وبيانات المرسل فقط "
+        f"لمدة {BUSINESS_METADATA_RETENTION_DAYS} يومًا لمطابقة إشعار الحذف.\n"
+        "لا تشارك رمز Telegram أو كلمة المرور مع البوت أو أي شخص."
+    )
+    keyboard = [
+        [admin_button("🔄 تحديث حالة الربط", "business_status", style="success")],
+        [admin_button("🔙 رجوع", "back_owner", icon_key="back")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    connection = update.business_connection
+    if connection is None:
+        return
+
+    connected_user = getattr(connection, "user", None)
+    if connected_user is None or connected_user.id != config.OWNER_ID:
+        logger.warning("Ignoring a Telegram Business connection that does not belong to OWNER_ID")
+        return
+
+    is_enabled = bool(connection.is_enabled)
+    save_business_connection(connection.id, config.OWNER_ID, is_enabled)
+    if is_enabled:
+        text = (
+            "✅ تم تأكيد ربط Telegram Business.\n"
+            "سيعالج البوت أحداث الرسائل الواردة في المحادثات التي اخترتها، "
+            "ويرسل إشعارًا عند وصول رسالة أو تعديلها أو حذفها."
+        )
+    else:
+        delete_business_message_metadata_for_connection(connection.id)
+        text = (
+            "ℹ️ تم إيقاف اتصال Telegram Business. أوقفت التنبيهات ومسحت بيانات "
+            "تعريف الرسائل المرتبطة بهذا الاتصال."
+        )
+    try:
+        await context.bot.send_message(chat_id=config.OWNER_ID, text=text)
+    except Exception:
+        logger.exception("Could not notify the owner about a Business connection change")
+
+
+def _business_sender_label(metadata):
+    if metadata is None:
+        return "مرسل غير معروف (الرسالة خارج فترة السجل أو وصلت قبل الربط)"
+    label = metadata.get("sender_name") or "مستخدم Telegram"
+    username = metadata.get("sender_username")
+    if username:
+        label += f" (@{username})"
+    sender_id = metadata.get("sender_id")
+    if sender_id:
+        label += f" — ID: {sender_id}"
+    return label
+
+
+async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_edit = update.edited_business_message is not None
+    message = update.edited_business_message or update.business_message
+    if message is None or not message.business_connection_id:
+        return
+
+    connection = get_business_connection(message.business_connection_id)
+    if (
+        connection is None
+        or connection["owner_id"] != config.OWNER_ID
+        or not connection["is_enabled"]
+    ):
+        return
+    if message.chat.type != "private":
+        return
+
+    sender = message.from_user
+    if sender is None:
+        return
+
+    # Track direction metadata so deletion alerts can ignore the owner's own messages.
+    is_incoming = (
+        sender.id != connection["owner_id"]
+        and getattr(message, "sender_business_bot", None) is None
+    )
+    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
+    save_business_message_metadata(
+        connection_id=message.business_connection_id,
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+        sender_id=sender.id,
+        sender_name=sender.full_name,
+        sender_username=sender.username,
+        is_incoming=is_incoming,
+    )
+    if not is_incoming:
+        return
+
+    label = "✏️ تم تعديل رسالة واردة" if is_edit else "📩 رسالة جديدة"
+    sender_label = sender.full_name or "مستخدم Telegram"
+    if sender.username:
+        sender_label += f" (@{sender.username})"
+    sender_label += f" — ID: {sender.id}"
+    lines = [label, f"👤 {sender_label}"]
+    content = message.text or message.caption
+    if content:
+        lines.extend(["", "النص الحالي:", content[:BUSINESS_MESSAGE_MAX_CHARS]])
+    else:
+        lines.extend(["", "الرسالة تحتوي على وسائط أو محتوى غير نصي."])
+    try:
+        await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text="\n".join(lines),
+        )
+    except Exception:
+        logger.exception("Could not send a Business message alert to the owner")
+
+
+async def handle_deleted_business_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    deleted = update.deleted_business_messages
+    if deleted is None:
+        return
+
+    connection = get_business_connection(deleted.business_connection_id)
+    if (
+        connection is None
+        or connection["owner_id"] != config.OWNER_ID
+        or not connection["is_enabled"]
+    ):
+        return
+
+    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
+    lines = ["🗑️ تم حذف رسالة أو رسائل من محادثة Telegram Business:"]
+    metadata_to_delete = []
+    shown = 0
+    total_alerts = 0
+    for message_id in deleted.message_ids:
+        metadata = get_business_message_metadata(
+            deleted.business_connection_id,
+            deleted.chat.id,
+            message_id,
+        )
+        if metadata is not None:
+            metadata_to_delete.append(message_id)
+            if not metadata["is_incoming"]:
+                continue
+        total_alerts += 1
+        if shown >= 20:
+            continue
+        sender_label = _business_sender_label(metadata)
+        lines.append(f"• {sender_label} — رقم الرسالة {message_id}")
+        shown += 1
+
+    remaining = max(0, total_alerts - shown)
+    if remaining:
+        lines.append(f"• توجد {remaining} رسائل محذوفة أخرى.")
+    if shown == 0:
+        for message_id in metadata_to_delete:
+            delete_business_message_metadata(
+                deleted.business_connection_id,
+                deleted.chat.id,
+                message_id,
+            )
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text="\n".join(lines)[:3500],
+        )
+    except Exception:
+        logger.exception("Could not send a Business deletion alert to the owner")
+        return
+
+    for message_id in metadata_to_delete:
+        delete_business_message_metadata(
+            deleted.business_connection_id,
+            deleted.chat.id,
+            message_id,
+        )
+
+
+async def cleanup_business_message_metadata(context: ContextTypes.DEFAULT_TYPE):
+    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
+
+
+async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route only official Telegram Business updates; other bot updates are ignored."""
+    if update.business_connection is not None:
+        await handle_business_connection(update, context)
+    elif (
+        update.business_message is not None
+        or update.edited_business_message is not None
+    ):
+        await handle_business_message(update, context)
+    elif update.deleted_business_messages is not None:
+        await handle_deleted_business_messages(update, context)
 
 
 async def button_icons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -822,38 +1054,51 @@ async def set_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
+    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
     application = Application.builder().token(config.BOT_TOKEN).build()
+    if application.job_queue is not None:
+        application.job_queue.run_repeating(
+            cleanup_business_message_metadata,
+            interval=24 * 60 * 60,
+            first=60,
+            name="cleanup_business_message_metadata",
+        )
     
     # أوامر المستخدم
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", owner_panel))
+    application.add_handler(CommandHandler("start", start, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("admin", owner_panel, filters=filters.UpdateType.MESSAGE))
     application.add_handler(MessageHandler(
-        filters.StatusUpdate.NEW_CHAT_MEMBERS & filters.ChatType.GROUPS,
+        filters.UpdateType.MESSAGE & filters.StatusUpdate.NEW_CHAT_MEMBERS & filters.ChatType.GROUPS,
         notify_new_group_members,
     ))
     application.add_handler(MessageHandler(
-        filters.TEXT
+        filters.UpdateType.MESSAGE
+        & filters.TEXT
         & filters.User(config.OWNER_ID)
         & filters.Regex(r"(?i)^\s*(?:/admin(?:@\w+)?|ادمن|أدمن)\s*$"),
         owner_panel,
     ))
     application.add_handler(MessageHandler(
-        filters.ALL
+        filters.UpdateType.MESSAGE
+        & filters.ALL
         & ~filters.COMMAND
         & filters.User(config.OWNER_ID),
         handle_owner_reply,
     ))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_user_message))
+    application.add_handler(MessageHandler(
+        filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        handle_user_message,
+    ))
     
     # أوامر المالك
-    application.add_handler(CommandHandler("owner", owner_panel))
-    application.add_handler(CommandHandler("ban", ban_user))
-    application.add_handler(CommandHandler("unban", unban_user))
-    application.add_handler(CommandHandler("restrict", restrict_user))
-    application.add_handler(CommandHandler("unrestrict", unrestrict_user))
-    application.add_handler(CommandHandler("stats", user_stats))
-    application.add_handler(CommandHandler("set_broadcast", set_broadcast))
-    application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("owner", owner_panel, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("ban", ban_user, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("unban", unban_user, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("restrict", restrict_user, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("unrestrict", unrestrict_user, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("stats", user_stats, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("set_broadcast", set_broadcast, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("broadcast", broadcast, filters=filters.UpdateType.MESSAGE))
     
     # أزرار لوحة التحكم
     application.add_handler(CallbackQueryHandler(owner_panel, pattern="^(?:open_admin_panel|back_owner)$"))
@@ -868,6 +1113,19 @@ def main():
     application.add_handler(CallbackQueryHandler(edit_ack, pattern="^edit_ack$"))
     application.add_handler(CallbackQueryHandler(set_channel, pattern="^set_channel$"))
     application.add_handler(CallbackQueryHandler(set_bot, pattern="^set_bot$"))
+    application.add_handler(
+        CallbackQueryHandler(
+            business_link_menu,
+            pattern="^(?:business_link|business_status)$",
+        )
+    )
+
+    # Process Telegram Business updates in a separate group so ordinary bot
+    # commands and anonymous-message handling never consume personal-account updates.
+    application.add_handler(
+        TypeHandler(Update, handle_business_update),
+        group=1,
+    )
     
     print("البوت يعمل الآن...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)

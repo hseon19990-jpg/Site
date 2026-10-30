@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from config import DB_NAME
 
 def init_db():
@@ -29,6 +30,28 @@ def init_db():
         user_id INTEGER NOT NULL,
         PRIMARY KEY (chat_id, message_id)
     )''')
+    # بيانات اتصال Telegram Business وصندوق أحداث الرسائل.
+    c.execute('''CREATE TABLE IF NOT EXISTS business_connections (
+        connection_id TEXT PRIMARY KEY,
+        owner_id INTEGER NOT NULL,
+        is_enabled INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS business_message_metadata (
+        connection_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        sender_id INTEGER,
+        sender_name TEXT NOT NULL DEFAULT '',
+        sender_username TEXT,
+        is_incoming INTEGER NOT NULL DEFAULT 1,
+        recorded_at INTEGER NOT NULL,
+        PRIMARY KEY (connection_id, chat_id, message_id)
+    )''')
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_business_message_recorded_at "
+        "ON business_message_metadata(recorded_at)"
+    )
     # جدول الإعدادات
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -149,3 +172,130 @@ def get_all_users():
     users = c.fetchall()
     conn.close()
     return [u[0] for u in users]
+
+
+# Telegram Business connection state and minimal message metadata.
+def save_business_connection(connection_id, owner_id, is_enabled):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO business_connections "
+        "(connection_id, owner_id, is_enabled, updated_at) VALUES (?, ?, ?, ?)",
+        (connection_id, owner_id, int(bool(is_enabled)), int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_business_connection(connection_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT owner_id, is_enabled FROM business_connections WHERE connection_id = ?",
+        (connection_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return {"owner_id": row[0], "is_enabled": bool(row[1])}
+
+
+def count_active_business_connections(owner_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT COUNT(*) FROM business_connections "
+        "WHERE owner_id = ? AND is_enabled = 1",
+        (owner_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def save_business_message_metadata(
+    connection_id,
+    chat_id,
+    message_id,
+    sender_id,
+    sender_name,
+    sender_username,
+    is_incoming,
+    recorded_at=None,
+):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO business_message_metadata "
+        "(connection_id, chat_id, message_id, sender_id, sender_name, "
+        "sender_username, is_incoming, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            connection_id,
+            chat_id,
+            message_id,
+            sender_id,
+            sender_name or "",
+            sender_username,
+            int(bool(is_incoming)),
+            int(recorded_at if recorded_at is not None else time.time()),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_business_message_metadata(connection_id, chat_id, message_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT sender_id, sender_name, sender_username, is_incoming "
+        "FROM business_message_metadata "
+        "WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
+        (connection_id, chat_id, message_id),
+    )
+    row = c.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return {
+        "sender_id": row[0],
+        "sender_name": row[1],
+        "sender_username": row[2],
+        "is_incoming": bool(row[3]),
+    }
+
+
+def delete_business_message_metadata(connection_id, chat_id, message_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM business_message_metadata "
+        "WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
+        (connection_id, chat_id, message_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_business_message_metadata_for_connection(connection_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM business_message_metadata WHERE connection_id = ?",
+        (connection_id,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def prune_business_message_metadata(retention_days):
+    cutoff = int(time.time()) - max(1, int(retention_days)) * 86400
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "DELETE FROM business_message_metadata WHERE recorded_at < ?",
+        (cutoff,),
+    )
+    conn.commit()
+    conn.close()
