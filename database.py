@@ -45,12 +45,41 @@ def init_db():
         sender_name TEXT NOT NULL DEFAULT '',
         sender_username TEXT,
         is_incoming INTEGER NOT NULL DEFAULT 1,
+        message_text TEXT NOT NULL DEFAULT '',
+        media_signature TEXT NOT NULL DEFAULT '',
         recorded_at INTEGER NOT NULL,
         PRIMARY KEY (connection_id, chat_id, message_id)
     )''')
+    c.execute("PRAGMA table_info(business_message_metadata)")
+    business_message_columns = {row[1] for row in c.fetchall()}
+    if "message_text" not in business_message_columns:
+        c.execute(
+            "ALTER TABLE business_message_metadata "
+            "ADD COLUMN message_text TEXT NOT NULL DEFAULT ''"
+        )
+    if "media_signature" not in business_message_columns:
+        c.execute(
+            "ALTER TABLE business_message_metadata "
+            "ADD COLUMN media_signature TEXT NOT NULL DEFAULT ''"
+        )
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_business_message_recorded_at "
         "ON business_message_metadata(recorded_at)"
+    )
+    c.execute('''CREATE TABLE IF NOT EXISTS business_media_files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        connection_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        file_path TEXT NOT NULL UNIQUE,
+        file_name TEXT,
+        mime_type TEXT,
+        file_size INTEGER,
+        recorded_at INTEGER NOT NULL
+    )''')
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS idx_business_media_recorded_at "
+        "ON business_media_files(recorded_at)"
     )
     # جدول الإعدادات
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
@@ -222,6 +251,8 @@ def save_business_message_metadata(
     sender_name,
     sender_username,
     is_incoming,
+    message_text="",
+    media_signature="",
     recorded_at=None,
 ):
     conn = sqlite3.connect(DB_NAME)
@@ -229,7 +260,8 @@ def save_business_message_metadata(
     c.execute(
         "INSERT OR REPLACE INTO business_message_metadata "
         "(connection_id, chat_id, message_id, sender_id, sender_name, "
-        "sender_username, is_incoming, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "sender_username, is_incoming, message_text, media_signature, recorded_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             connection_id,
             chat_id,
@@ -238,6 +270,8 @@ def save_business_message_metadata(
             sender_name or "",
             sender_username,
             int(bool(is_incoming)),
+            message_text or "",
+            media_signature or "",
             int(recorded_at if recorded_at is not None else time.time()),
         ),
     )
@@ -249,7 +283,8 @@ def get_business_message_metadata(connection_id, chat_id, message_id):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute(
-        "SELECT sender_id, sender_name, sender_username, is_incoming "
+        "SELECT sender_id, sender_name, sender_username, is_incoming, "
+        "message_text, media_signature "
         "FROM business_message_metadata "
         "WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
         (connection_id, chat_id, message_id),
@@ -263,7 +298,61 @@ def get_business_message_metadata(connection_id, chat_id, message_id):
         "sender_name": row[1],
         "sender_username": row[2],
         "is_incoming": bool(row[3]),
+        "message_text": row[4],
+        "media_signature": row[5],
     }
+
+
+def add_business_media_file(
+    connection_id,
+    chat_id,
+    message_id,
+    file_path,
+    file_name=None,
+    mime_type=None,
+    file_size=None,
+    recorded_at=None,
+):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO business_media_files "
+        "(connection_id, chat_id, message_id, file_path, file_name, "
+        "mime_type, file_size, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            connection_id,
+            chat_id,
+            message_id,
+            file_path,
+            file_name,
+            mime_type,
+            file_size,
+            int(recorded_at if recorded_at is not None else time.time()),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_expired_business_media_files(retention_days):
+    cutoff = int(time.time()) - max(1, int(retention_days)) * 86400
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT file_path FROM business_media_files WHERE recorded_at < ?",
+        (cutoff,),
+    )
+    paths = [row[0] for row in c.fetchall()]
+    conn.close()
+    return paths
+
+
+def delete_business_media_file(file_path):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM business_media_files WHERE file_path = ?", (file_path,))
+    conn.commit()
+    conn.close()
 
 
 def delete_business_message_metadata(connection_id, chat_id, message_id):

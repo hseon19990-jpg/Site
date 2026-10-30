@@ -1,7 +1,11 @@
 import logging
 import json
+import hashlib
+import mimetypes
 import re
+import uuid
 from html import escape as html_escape
+from pathlib import Path
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity,
     ReplyParameters,
@@ -19,8 +23,8 @@ from database import (
     get_user_gender, set_user_gender, save_message_target, get_message_target,
     save_business_connection, get_business_connection,
     count_active_business_connections, save_business_message_metadata,
-    get_business_message_metadata, delete_business_message_metadata,
-    delete_business_message_metadata_for_connection,
+    get_business_message_metadata, add_business_media_file,
+    get_expired_business_media_files, delete_business_media_file,
     prune_business_message_metadata,
 )
 
@@ -28,6 +32,7 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 BUSINESS_METADATA_RETENTION_DAYS = 30
 BUSINESS_MESSAGE_MAX_CHARS = 3000
+BUSINESS_MEDIA_DIR = Path(getattr(config, "BUSINESS_MEDIA_DIR", "business_media"))
 
 BUTTON_ICON_LABELS = {
     "admin": "لوحة الإدارة",
@@ -457,9 +462,10 @@ async def business_link_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "جهات الاتصال وغير جهات الاتصال، ولا تستثنِ أفرادًا. امنحه أقل الصلاحيات المعروضة. "
         "لا تمنحه صلاحية الرد أو الحذف أو إدارة القصص لهذا التنبيه.\n"
         "4) ارجع إلى هنا واضغط «تحديث حالة الربط». سيصل تأكيد عند استلام Telegram للاتصال.\n\n"
-        "🔒 الخصوصية: البوت يرسل للمالك إشعارًا بالرسالة الجديدة أو تعديلها. "
-        "لا يخزّن نص الرسالة في قاعدة بياناته؛ يحتفظ بمعرّف الرسالة وبيانات المرسل فقط "
-        f"لمدة {BUSINESS_METADATA_RETENTION_DAYS} يومًا لمطابقة إشعار الحذف.\n"
+        "🔒 الخصوصية: لا يرسل البوت تنبيهًا عند الرسائل الجديدة؛ يرسل تنبيهًا فقط "
+        "عند تعديل رسالة واردة أو حذفها، ويعرض النص قبل التعديل وبعده. "
+        "يحفظ نص الرسالة وملفاتها المرفقة محليًا لمدة 30 يومًا ثم يحذفها تلقائيًا.\n"
+        f"مسار حفظ الملفات: {BUSINESS_MEDIA_DIR}.\n"
         "لا تشارك رمز Telegram أو كلمة المرور مع البوت أو أي شخص."
     )
     keyboard = [
@@ -485,13 +491,12 @@ async def handle_business_connection(update: Update, context: ContextTypes.DEFAU
         text = (
             "✅ تم تأكيد ربط Telegram Business.\n"
             "سيعالج البوت أحداث الرسائل الواردة في المحادثات التي اخترتها، "
-            "ويرسل إشعارًا عند وصول رسالة أو تعديلها أو حذفها."
+            "ويرسل إشعارًا فقط عند تعديل رسالة أو حذفها. لا يرسل تنبيهًا عند الرسائل الجديدة."
         )
     else:
-        delete_business_message_metadata_for_connection(connection.id)
         text = (
-            "ℹ️ تم إيقاف اتصال Telegram Business. أوقفت التنبيهات ومسحت بيانات "
-            "تعريف الرسائل المرتبطة بهذا الاتصال."
+            "ℹ️ تم إيقاف اتصال Telegram Business. توقفت التنبيهات الجديدة؛ "
+            "ستبقى الرسائل والملفات المؤرشفة حتى انتهاء مدة الاحتفاظ البالغة 30 يومًا."
         )
     try:
         await context.bot.send_message(chat_id=config.OWNER_ID, text=text)
@@ -510,6 +515,186 @@ def _business_sender_label(metadata):
     if sender_id:
         label += f" — ID: {sender_id}"
     return label
+
+
+def _business_media_items(message):
+    """Return one downloadable file per attachment, preferring the largest photo."""
+    items = []
+    photos = getattr(message, "photo", None) or []
+    if photos:
+        items.append(("photo", max(
+            photos,
+            key=lambda item: (
+                getattr(item, "file_size", 0) or 0,
+                getattr(item, "width", 0) * getattr(item, "height", 0),
+            ),
+        )))
+
+    for media_type in (
+        "animation",
+        "audio",
+        "document",
+        "video",
+        "video_note",
+        "voice",
+        "sticker",
+    ):
+        attachment = getattr(message, media_type, None)
+        if attachment is not None:
+            items.append((media_type, attachment))
+
+    paid_media = getattr(message, "paid_media", None)
+    for paid_item in getattr(paid_media, "paid_media", []) or []:
+        for media_type in ("photo", "video"):
+            attachment = getattr(paid_item, media_type, None)
+            if attachment is not None:
+                items.append((media_type, attachment))
+
+    unique_items = []
+    seen = set()
+    for media_type, attachment in items:
+        identity = (
+            getattr(attachment, "file_unique_id", None)
+            or getattr(attachment, "file_id", None)
+        )
+        if identity and identity not in seen:
+            seen.add(identity)
+            unique_items.append((media_type, attachment))
+    return unique_items
+
+
+def _business_message_content(message, media_items):
+    if message.text is not None:
+        return message.text
+    if message.caption is not None:
+        return message.caption
+
+    labels = {
+        "photo": "صورة",
+        "animation": "رسوم متحركة",
+        "audio": "ملف صوتي",
+        "document": "ملف",
+        "video": "فيديو",
+        "video_note": "رسالة فيديو",
+        "voice": "رسالة صوتية",
+        "sticker": "ملصق",
+    }
+    if media_items:
+        attachments = "، ".join(labels.get(kind, "مرفق") for kind, _ in media_items)
+        return f"[رسالة تحتوي على {attachments}]"
+    return "[رسالة بدون نص]"
+
+
+def _business_media_signature(media_items):
+    identities = [
+        getattr(media, "file_unique_id", None)
+        or getattr(media, "file_id", "")
+        for _, media in media_items
+    ]
+    if not identities:
+        return ""
+    return hashlib.sha256("\0".join(identities).encode("utf-8")).hexdigest()
+
+
+def _business_media_extension(media_type, media):
+    original_name = getattr(media, "file_name", None)
+    if original_name:
+        suffix = Path(original_name).suffix
+        if suffix and len(suffix) <= 12 and suffix[1:].isalnum():
+            return suffix.lower()
+    guessed = mimetypes.guess_extension(getattr(media, "mime_type", None) or "")
+    if guessed:
+        return guessed
+    return {
+        "photo": ".jpg",
+        "video": ".mp4",
+        "video_note": ".mp4",
+        "animation": ".mp4",
+        "voice": ".ogg",
+        "audio": ".mp3",
+        "sticker": ".webp",
+    }.get(media_type, ".bin")
+
+
+async def archive_business_media(message, context, media_items):
+    """Download supported Telegram attachments into the 30-day local archive."""
+    if not media_items:
+        return
+
+    try:
+        BUSINESS_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Could not create Telegram Business media archive directory (error=%s)",
+            type(exc).__name__,
+        )
+        return
+
+    for media_type, media in media_items:
+        file_id = getattr(media, "file_id", None)
+        if not file_id:
+            continue
+
+        destination = BUSINESS_MEDIA_DIR / (
+            f"{uuid.uuid4().hex}{_business_media_extension(media_type, media)}"
+        )
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            await telegram_file.download_to_drive(custom_path=str(destination))
+            add_business_media_file(
+                connection_id=message.business_connection_id,
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                file_path=str(destination.resolve()),
+                file_name=Path(getattr(media, "file_name", "") or "").name or None,
+                mime_type=getattr(media, "mime_type", None),
+                file_size=getattr(media, "file_size", None),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not archive Telegram Business attachment "
+                "(message_id=%s, media_type=%s, error=%s)",
+                message.message_id,
+                media_type,
+                type(exc).__name__,
+            )
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def prune_business_archive():
+    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
+    media_root = BUSINESS_MEDIA_DIR.resolve()
+    for media_path in get_expired_business_media_files(
+        BUSINESS_METADATA_RETENTION_DAYS
+    ):
+        path = Path(media_path).resolve()
+        if media_root not in path.parents:
+            logger.error("Refusing to remove an archived media path outside the archive directory")
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove an expired archived media file", exc_info=True)
+            continue
+        delete_business_media_file(media_path)
+
+
+def _clip_business_text(text):
+    if len(text) <= BUSINESS_MESSAGE_MAX_CHARS:
+        return text
+    return text[:BUSINESS_MESSAGE_MAX_CHARS] + "\n… (تم اختصار النص)"
+
+
+async def send_business_alert(context, text):
+    # Telegram limits a text message to 4096 characters; split long old/new pairs.
+    for offset in range(0, len(text), 3800):
+        await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text=text[offset:offset + 3800],
+        )
 
 
 async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -537,7 +722,14 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         sender.id != connection["owner_id"]
         and getattr(message, "sender_business_bot", None) is None
     )
-    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
+    previous = get_business_message_metadata(
+        message.business_connection_id,
+        message.chat.id,
+        message.message_id,
+    )
+    media_items = _business_media_items(message)
+    content = _business_message_content(message, media_items)
+    media_signature = _business_media_signature(media_items)
     save_business_message_metadata(
         connection_id=message.business_connection_id,
         chat_id=message.chat.id,
@@ -546,28 +738,48 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         sender_name=sender.full_name,
         sender_username=sender.username,
         is_incoming=is_incoming,
+        message_text=content,
+        media_signature=media_signature,
     )
+    await archive_business_media(message, context, media_items)
     if not is_incoming:
         return
 
-    label = "✏️ تم تعديل رسالة واردة" if is_edit else "📩 رسالة جديدة"
+    # New messages are archived silently. Only edits and deletions notify the owner.
+    if not is_edit:
+        return
+
+    old_content = (
+        previous.get("message_text")
+        if previous and previous.get("message_text")
+        else "[النص السابق غير متوفر]"
+    )
+    media_changed = bool(
+        previous
+        and previous.get("media_signature")
+        and previous.get("media_signature") != media_signature
+    )
+    if media_changed:
+        old_content += "\n[المرفق السابق]"
+        content += "\n[تم تغيير المرفق]"
     sender_label = sender.full_name or "مستخدم Telegram"
     if sender.username:
         sender_label += f" (@{sender.username})"
     sender_label += f" — ID: {sender.id}"
-    lines = [label, f"👤 {sender_label}"]
-    content = message.text or message.caption
-    if content:
-        lines.extend(["", "النص الحالي:", content[:BUSINESS_MESSAGE_MAX_CHARS]])
-    else:
-        lines.extend(["", "الرسالة تحتوي على وسائط أو محتوى غير نصي."])
+    lines = [
+        "✏️ تم تعديل رسالة واردة",
+        f"👤 {sender_label}",
+        "",
+        "قبل التعديل:",
+        _clip_business_text(old_content),
+        "",
+        "بعد التعديل:",
+        _clip_business_text(content),
+    ]
     try:
-        await context.bot.send_message(
-            chat_id=config.OWNER_ID,
-            text="\n".join(lines),
-        )
+        await send_business_alert(context, "\n".join(lines))
     except Exception:
-        logger.exception("Could not send a Business message alert to the owner")
+        logger.exception("Could not send a Business edit alert to the owner")
 
 
 async def handle_deleted_business_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,9 +795,7 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
     ):
         return
 
-    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
     lines = ["🗑️ تم حذف رسالة أو رسائل من محادثة Telegram Business:"]
-    metadata_to_delete = []
     shown = 0
     total_alerts = 0
     for message_id in deleted.message_ids:
@@ -595,7 +805,6 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
             message_id,
         )
         if metadata is not None:
-            metadata_to_delete.append(message_id)
             if not metadata["is_incoming"]:
                 continue
         total_alerts += 1
@@ -609,33 +818,16 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
     if remaining:
         lines.append(f"• توجد {remaining} رسائل محذوفة أخرى.")
     if shown == 0:
-        for message_id in metadata_to_delete:
-            delete_business_message_metadata(
-                deleted.business_connection_id,
-                deleted.chat.id,
-                message_id,
-            )
         return
 
     try:
-        await context.bot.send_message(
-            chat_id=config.OWNER_ID,
-            text="\n".join(lines)[:3500],
-        )
+        await send_business_alert(context, "\n".join(lines)[:3500])
     except Exception:
         logger.exception("Could not send a Business deletion alert to the owner")
-        return
-
-    for message_id in metadata_to_delete:
-        delete_business_message_metadata(
-            deleted.business_connection_id,
-            deleted.chat.id,
-            message_id,
-        )
 
 
 async def cleanup_business_message_metadata(context: ContextTypes.DEFAULT_TYPE):
-    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
+    prune_business_archive()
 
 
 async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1054,14 +1246,14 @@ async def set_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
-    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
+    prune_business_archive()
     application = Application.builder().token(config.BOT_TOKEN).build()
     if application.job_queue is not None:
         application.job_queue.run_repeating(
             cleanup_business_message_metadata,
-            interval=24 * 60 * 60,
+            interval=60 * 60,
             first=60,
-            name="cleanup_business_message_metadata",
+            name="cleanup_business_archive",
         )
     
     # أوامر المستخدم
