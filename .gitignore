@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.py[cod]
+site_bot.db
+site_bot.db-*
+business_media/
