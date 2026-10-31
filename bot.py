@@ -24,12 +24,39 @@ from database import (
     save_business_connection, get_business_connection,
     count_active_business_connections, save_business_message_metadata,
     get_business_message_metadata, add_business_media_file,
+    get_business_media_files_for_message,
     get_expired_business_media_files, delete_business_media_file,
     prune_business_message_metadata,
 )
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class TelegramTokenRedactionFilter(logging.Filter):
+    """Prevent HTTP request logs from exposing Telegram bot tokens in API URLs."""
+
+    _telegram_url = re.compile(
+        r"(https?://api\.telegram\.org/(?:file/)?bot)[^/\s?\"']+",
+        re.IGNORECASE,
+    )
+
+    def filter(self, record):
+        try:
+            record.msg = self._telegram_url.sub(r"\1[REDACTED]", record.getMessage())
+            record.args = ()
+        except Exception:
+            record.msg = "[log message redacted]"
+            record.args = ()
+        return True
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(TelegramTokenRedactionFilter())
+# Successful HTTP requests include the bot token in the URL, so keep routine
+# httpx request logs out of Railway's runtime log stream.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 BUSINESS_METADATA_RETENTION_DAYS = 30
 BUSINESS_MESSAGE_MAX_CHARS = 3000
 BUSINESS_MEDIA_DIR = Path(getattr(config, "BUSINESS_MEDIA_DIR", "business_media"))
@@ -314,7 +341,10 @@ async def set_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
     user = update.effective_user
+    if message is None or user is None:
+        return
     add_user(user.id, user.full_name, user.username)
     
     if not await is_subscribed(update, context):
@@ -358,8 +388,13 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     gendered_label = "رسالة الولد" if gender == "male" else "رسالة الاميرة"
     sender_message = await context.bot.send_message(
         chat_id=config.OWNER_ID,
-        text=f"<b>{gendered_label}:</b>\n{html_escape(update.message.text)}",
+        text=f"<b>{gendered_label}:</b>\n{html_escape(message.text)}",
         parse_mode=ParseMode.HTML,
+        reply_parameters=ReplyParameters(message_id=sender_info.message_id),
+    ) if message.text is not None else await context.bot.copy_message(
+        chat_id=config.OWNER_ID,
+        from_chat_id=user.id,
+        message_id=message.message_id,
         reply_parameters=ReplyParameters(message_id=sender_info.message_id),
     )
     save_message_target(
@@ -795,9 +830,14 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
     ):
         return
 
+    logger.info(
+        "Received Telegram Business deletion update for %d message(s)",
+        len(deleted.message_ids),
+    )
     lines = ["🗑️ تم حذف رسالة أو رسائل من محادثة Telegram Business:"]
     shown = 0
     total_alerts = 0
+    archived_media = []
     for message_id in deleted.message_ids:
         metadata = get_business_message_metadata(
             deleted.business_connection_id,
@@ -811,7 +851,23 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
         if shown >= 20:
             continue
         sender_label = _business_sender_label(metadata)
-        lines.append(f"• {sender_label} — رقم الرسالة {message_id}")
+        content = (
+            metadata.get("message_text")
+            if metadata and metadata.get("message_text")
+            else "[محتوى الرسالة غير متوفر في الأرشيف]"
+        )
+        lines.append(
+            f"• {sender_label} — رقم الرسالة {message_id}\n"
+            f"المحتوى المحذوف: {_clip_business_text(content)}"
+        )
+        archived_media.extend(
+            (message_id, sender_label, media_file)
+            for media_file in get_business_media_files_for_message(
+                deleted.business_connection_id,
+                deleted.chat.id,
+                message_id,
+            )
+        )
         shown += 1
 
     remaining = max(0, total_alerts - shown)
@@ -824,6 +880,48 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
         await send_business_alert(context, "\n".join(lines)[:3500])
     except Exception:
         logger.exception("Could not send a Business deletion alert to the owner")
+        return
+
+    media_root = BUSINESS_MEDIA_DIR.resolve()
+    for message_id, sender_label, media_file in archived_media:
+        path = Path(media_file["file_path"]).resolve()
+        if media_root not in path.parents or not path.is_file():
+            logger.warning(
+                "Archived media is unavailable for deleted Business message %s",
+                message_id,
+            )
+            continue
+
+        caption = f"📎 مرفق محفوظ من الرسالة المحذوفة\n👤 {sender_label}"
+        extension = path.suffix.lower()
+        try:
+            with path.open("rb") as attachment:
+                if extension in {".jpg", ".jpeg", ".png"}:
+                    await context.bot.send_photo(
+                        chat_id=config.OWNER_ID,
+                        photo=attachment,
+                        caption=caption,
+                    )
+                elif extension in {".mp4"}:
+                    await context.bot.send_video(
+                        chat_id=config.OWNER_ID,
+                        video=attachment,
+                        caption=caption,
+                    )
+                else:
+                    await context.bot.send_document(
+                        chat_id=config.OWNER_ID,
+                        document=attachment,
+                        filename=media_file.get("file_name") or path.name,
+                        caption=caption,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Could not send archived media for deleted Business message "
+                "(message_id=%s, error=%s)",
+                message_id,
+                type(exc).__name__,
+            )
 
 
 async def cleanup_business_message_metadata(context: ContextTypes.DEFAULT_TYPE):
@@ -1278,7 +1376,10 @@ def main():
         handle_owner_reply,
     ))
     application.add_handler(MessageHandler(
-        filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        filters.UpdateType.MESSAGE
+        & filters.ALL
+        & ~filters.COMMAND
+        & filters.ChatType.PRIVATE,
         handle_user_message,
     ))
     

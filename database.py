@@ -334,6 +334,29 @@ def add_business_media_file(
     conn.close()
 
 
+def get_business_media_files_for_message(connection_id, chat_id, message_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT file_path, file_name, mime_type, file_size "
+        "FROM business_media_files "
+        "WHERE connection_id = ? AND chat_id = ? AND message_id = ? "
+        "ORDER BY id",
+        (connection_id, chat_id, message_id),
+    )
+    files = [
+        {
+            "file_path": row[0],
+            "file_name": row[1],
+            "mime_type": row[2],
+            "file_size": row[3],
+        }
+        for row in c.fetchall()
+    ]
+    conn.close()
+    return files
+
+
 def get_expired_business_media_files(retention_days):
     cutoff = int(time.time()) - max(1, int(retention_days)) * 86400
     conn = sqlite3.connect(DB_NAME)
