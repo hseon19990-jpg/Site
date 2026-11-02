@@ -77,6 +77,12 @@ def init_db():
         file_size INTEGER,
         recorded_at INTEGER NOT NULL
     )''')
+    c.execute("PRAGMA table_info(business_media_files)")
+    business_media_columns = {row[1] for row in c.fetchall()}
+    if "media_type" not in business_media_columns:
+        c.execute("ALTER TABLE business_media_files ADD COLUMN media_type TEXT")
+    if "file_id" not in business_media_columns:
+        c.execute("ALTER TABLE business_media_files ADD COLUMN file_id TEXT")
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_business_media_recorded_at "
         "ON business_media_files(recorded_at)"
@@ -312,13 +318,16 @@ def add_business_media_file(
     mime_type=None,
     file_size=None,
     recorded_at=None,
+    media_type=None,
+    file_id=None,
 ):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute(
         "INSERT OR IGNORE INTO business_media_files "
         "(connection_id, chat_id, message_id, file_path, file_name, "
-        "mime_type, file_size, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "mime_type, file_size, recorded_at, media_type, file_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             connection_id,
             chat_id,
@@ -328,10 +337,37 @@ def add_business_media_file(
             mime_type,
             file_size,
             int(recorded_at if recorded_at is not None else time.time()),
+            media_type,
+            file_id,
         ),
     )
     conn.commit()
     conn.close()
+
+
+def get_business_media_files(connection_id, chat_id, message_id):
+    """Return archived attachments saved for one Business message."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT file_path, file_name, mime_type, media_type, file_id "
+        "FROM business_media_files "
+        "WHERE connection_id = ? AND chat_id = ? AND message_id = ? "
+        "ORDER BY id",
+        (connection_id, chat_id, message_id),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {
+            "file_path": row[0],
+            "file_name": row[1],
+            "mime_type": row[2],
+            "media_type": row[3],
+            "file_id": row[4],
+        }
+        for row in rows
+    ]
 
 
 def get_expired_business_media_files(retention_days):
