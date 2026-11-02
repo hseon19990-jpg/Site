@@ -25,13 +25,14 @@ from database import (
     count_active_business_connections, save_business_message_metadata,
     get_business_message_metadata, add_business_media_file,
     get_expired_business_media_files, delete_business_media_file,
-    prune_business_message_metadata,
+    prune_business_message_metadata, get_business_media_files,
 )
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 BUSINESS_METADATA_RETENTION_DAYS = 30
 BUSINESS_MESSAGE_MAX_CHARS = 3000
+NO_LOCAL_FILE_PREFIX = "file_id:"
 BUSINESS_MEDIA_DIR = Path(getattr(config, "BUSINESS_MEDIA_DIR", "business_media"))
 
 BUTTON_ICON_LABELS = {
@@ -356,15 +357,35 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode=ParseMode.HTML,
     )
     gendered_label = "رسالة الولد" if gender == "male" else "رسالة الاميرة"
-    sender_message = await context.bot.send_message(
-        chat_id=config.OWNER_ID,
-        text=f"<b>{gendered_label}:</b>\n{html_escape(update.message.text)}",
-        parse_mode=ParseMode.HTML,
-        reply_parameters=ReplyParameters(message_id=sender_info.message_id),
-    )
+    if update.message.text is not None:
+        sender_message = await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text=f"<b>{gendered_label}:</b>\n{html_escape(update.message.text)}",
+            parse_mode=ParseMode.HTML,
+            reply_parameters=ReplyParameters(message_id=sender_info.message_id),
+        )
+        owner_message_id = sender_message.message_id
+    else:
+        # أي نوع آخر (صورة، ملصق، فيديو، صوت، ملف، موقع، جهة اتصال، استطلاع...)
+        # يُنسخ للمالك كما هو مع الحفاظ على الشرح (caption) إن وجد.
+        try:
+            copied = await context.bot.copy_message(
+                chat_id=config.OWNER_ID,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+                reply_parameters=ReplyParameters(message_id=sender_info.message_id),
+            )
+        except Exception:
+            logger.warning("copy_message failed; trying forward_message", exc_info=True)
+            copied = await context.bot.forward_message(
+                chat_id=config.OWNER_ID,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+            )
+        owner_message_id = copied.message_id
     save_message_target(
         config.OWNER_ID,
-        sender_message.message_id,
+        owner_message_id,
         user.id,
     )
     
@@ -582,6 +603,22 @@ def _business_message_content(message, media_items):
     if media_items:
         attachments = "، ".join(labels.get(kind, "مرفق") for kind, _ in media_items)
         return f"[رسالة تحتوي على {attachments}]"
+
+    # أنواع لا تحتوي ملفاً قابلاً للتنزيل لكنها قابلة للحذف.
+    if getattr(message, "location", None) is not None:
+        loc = message.location
+        return f"[موقع: {loc.latitude}, {loc.longitude}]"
+    if getattr(message, "venue", None) is not None:
+        return f"[مكان: {message.venue.title}]"
+    if getattr(message, "contact", None) is not None:
+        contact = message.contact
+        return f"[جهة اتصال: {contact.first_name} {contact.phone_number}]"
+    if getattr(message, "poll", None) is not None:
+        return f"[استطلاع: {message.poll.question}]"
+    if getattr(message, "dice", None) is not None:
+        return f"[لعبة {message.dice.emoji}: {message.dice.value}]"
+    if getattr(message, "game", None) is not None:
+        return f"[لعبة: {message.game.title}]"
     return "[رسالة بدون نص]"
 
 
@@ -638,18 +675,20 @@ async def archive_business_media(message, context, media_items):
         destination = BUSINESS_MEDIA_DIR / (
             f"{uuid.uuid4().hex}{_business_media_extension(media_type, media)}"
         )
+        common = dict(
+            connection_id=message.business_connection_id,
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            file_name=Path(getattr(media, "file_name", "") or "").name or None,
+            mime_type=getattr(media, "mime_type", None),
+            file_size=getattr(media, "file_size", None),
+            media_type=media_type,
+            file_id=file_id,
+        )
         try:
             telegram_file = await context.bot.get_file(file_id)
             await telegram_file.download_to_drive(custom_path=str(destination))
-            add_business_media_file(
-                connection_id=message.business_connection_id,
-                chat_id=message.chat.id,
-                message_id=message.message_id,
-                file_path=str(destination.resolve()),
-                file_name=Path(getattr(media, "file_name", "") or "").name or None,
-                mime_type=getattr(media, "mime_type", None),
-                file_size=getattr(media, "file_size", None),
-            )
+            add_business_media_file(file_path=str(destination.resolve()), **common)
         except Exception as exc:
             logger.warning(
                 "Could not archive Telegram Business attachment "
@@ -662,6 +701,10 @@ async def archive_business_media(message, context, media_items):
                 destination.unlink(missing_ok=True)
             except OSError:
                 pass
+            # حتى لو فشل التنزيل (ملف كبير مثلاً) نحفظ file_id لإعادة إرساله لاحقاً.
+            add_business_media_file(
+                file_path=f"{NO_LOCAL_FILE_PREFIX}{uuid.uuid4().hex}", **common
+            )
 
 
 def prune_business_archive():
@@ -670,6 +713,9 @@ def prune_business_archive():
     for media_path in get_expired_business_media_files(
         BUSINESS_METADATA_RETENTION_DAYS
     ):
+        if media_path.startswith(NO_LOCAL_FILE_PREFIX):
+            delete_business_media_file(media_path)
+            continue
         path = Path(media_path).resolve()
         if media_root not in path.parents:
             logger.error("Refusing to remove an archived media path outside the archive directory")
@@ -695,6 +741,65 @@ async def send_business_alert(context, text):
             chat_id=config.OWNER_ID,
             text=text[offset:offset + 3800],
         )
+
+
+_MEDIA_SENDERS = {
+    "photo": ("send_photo", "photo"),
+    "video": ("send_video", "video"),
+    "animation": ("send_animation", "animation"),
+    "audio": ("send_audio", "audio"),
+    "voice": ("send_voice", "voice"),
+    "video_note": ("send_video_note", "video_note"),
+    "sticker": ("send_sticker", "sticker"),
+    "document": ("send_document", "document"),
+}
+
+
+async def send_deleted_media(context, item):
+    """Send one archived attachment to the owner using its original type."""
+    method_name, arg_name = _MEDIA_SENDERS.get(
+        item.get("media_type"), ("send_document", "document")
+    )
+    sources = []
+    file_path = item.get("file_path") or ""
+    if file_path and not file_path.startswith(NO_LOCAL_FILE_PREFIX):
+        if Path(file_path).is_file():
+            sources.append("disk")
+    if item.get("file_id"):
+        sources.append("file_id")
+
+    for source in sources:
+        try:
+            method = getattr(context.bot, method_name)
+            if source == "disk":
+                with open(file_path, "rb") as handle:
+                    await method(chat_id=config.OWNER_ID, **{arg_name: handle})
+            else:
+                await method(chat_id=config.OWNER_ID, **{arg_name: item["file_id"]})
+            return
+        except Exception:
+            logger.warning(
+                "Could not resend deleted attachment as %s from %s",
+                item.get("media_type"),
+                source,
+                exc_info=True,
+            )
+
+    # آخر محاولة: إرساله كملف عادي من القرص.
+    try:
+        if "disk" in sources:
+            with open(file_path, "rb") as handle:
+                await context.bot.send_document(chat_id=config.OWNER_ID, document=handle)
+            return
+    except Exception:
+        logger.warning("Could not resend deleted attachment as a document", exc_info=True)
+    try:
+        await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text="⚠️ تعذّر استرجاع المرفق المحذوف (انتهى أو لم يُحفظ).",
+        )
+    except Exception:
+        logger.exception("Could not tell the owner an attachment was unavailable")
 
 
 async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -795,7 +900,6 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
     ):
         return
 
-    lines = ["🗑️ تم حذف رسالة أو رسائل من محادثة Telegram Business:"]
     shown = 0
     total_alerts = 0
     for message_id in deleted.message_ids:
@@ -804,26 +908,45 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
             deleted.chat.id,
             message_id,
         )
-        if metadata is not None:
-            if not metadata["is_incoming"]:
-                continue
+        if metadata is not None and not metadata["is_incoming"]:
+            continue
         total_alerts += 1
         if shown >= 20:
             continue
-        sender_label = _business_sender_label(metadata)
-        lines.append(f"• {sender_label} — رقم الرسالة {message_id}")
         shown += 1
+
+        # بطاقة لكل رسالة محذوفة: المرسل + المحتوى المحذوف نفسه.
+        lines = [
+            "🗑️ تم حذف رسالة",
+            f"👤 {_business_sender_label(metadata)}",
+            f"🔢 رقم الرسالة: {message_id}",
+        ]
+        if metadata is not None:
+            lines.append("")
+            lines.append("المحتوى المحذوف:")
+            lines.append(_clip_business_text(metadata.get("message_text") or "[بدون نص]"))
+        else:
+            lines.append("")
+            lines.append("[المحتوى غير متوفر في السجل]")
+        try:
+            await send_business_alert(context, "\n".join(lines))
+        except Exception:
+            logger.exception("Could not send a Business deletion alert to the owner")
+
+        # إرسال كل المرفقات المحذوفة (صور، ملصقات، فيديو، صوت، ملفات...).
+        for item in get_business_media_files(
+            deleted.business_connection_id, deleted.chat.id, message_id
+        ):
+            await send_deleted_media(context, item)
 
     remaining = max(0, total_alerts - shown)
     if remaining:
-        lines.append(f"• توجد {remaining} رسائل محذوفة أخرى.")
-    if shown == 0:
-        return
-
-    try:
-        await send_business_alert(context, "\n".join(lines)[:3500])
-    except Exception:
-        logger.exception("Could not send a Business deletion alert to the owner")
+        try:
+            await send_business_alert(
+                context, f"🗑️ توجد {remaining} رسائل محذوفة أخرى لم تُعرض."
+            )
+        except Exception:
+            logger.exception("Could not send the extra deletion count to the owner")
 
 
 async def cleanup_business_message_metadata(context: ContextTypes.DEFAULT_TYPE):
@@ -1278,7 +1401,11 @@ def main():
         handle_owner_reply,
     ))
     application.add_handler(MessageHandler(
-        filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
+        filters.UpdateType.MESSAGE
+        & filters.ALL
+        & ~filters.COMMAND
+        & ~filters.StatusUpdate.ALL
+        & filters.ChatType.PRIVATE,
         handle_user_message,
     ))
     
