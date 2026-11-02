@@ -1,426 +1,1453 @@
-import sqlite3
-import time
-from config import DB_NAME
+import logging
+import json
+import hashlib
+import mimetypes
+import re
+import uuid
+from html import escape as html_escape
+from pathlib import Path
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity,
+    ReplyParameters,
+)
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters,
+    ContextTypes, CallbackQueryHandler, TypeHandler
+)
+from telegram.constants import ParseMode
+import config
+from database import (
+    init_db, get_setting, set_setting, add_user, mark_user_start_notified,
+    increment_message_count, get_user, set_user_status, get_all_users,
+    get_user_gender, set_user_gender, save_message_target, get_message_target,
+    save_business_connection, get_business_connection,
+    count_active_business_connections, save_business_message_metadata,
+    get_business_message_metadata, add_business_media_file,
+    get_expired_business_media_files, delete_business_media_file,
+    prune_business_message_metadata, get_business_media_files,
+)
 
-def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    # جدول المستخدمين
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        full_name TEXT,
-        username TEXT,
-        messages_count INTEGER DEFAULT 0,
-        is_banned INTEGER DEFAULT 0,
-        is_restricted INTEGER DEFAULT 0,
-        gender TEXT,
-        start_notified INTEGER DEFAULT 0
-    )''')
-    # ترحيل قواعد البيانات الموجودة قبل إضافة اختيار الجنس.
-    c.execute("PRAGMA table_info(users)")
-    user_columns = {row[1] for row in c.fetchall()}
-    if "gender" not in user_columns:
-        c.execute("ALTER TABLE users ADD COLUMN gender TEXT")
-    if "start_notified" not in user_columns:
-        c.execute("ALTER TABLE users ADD COLUMN start_notified INTEGER DEFAULT 0")
-    # ربط رسائل المشرف بالمستخدم حتى تعمل الردود على رسالة المحتوى أيضاً.
-    c.execute('''CREATE TABLE IF NOT EXISTS message_targets (
-        chat_id INTEGER NOT NULL,
-        message_id INTEGER NOT NULL,
-        user_id INTEGER NOT NULL,
-        PRIMARY KEY (chat_id, message_id)
-    )''')
-    # بيانات اتصال Telegram Business وصندوق أحداث الرسائل.
-    c.execute('''CREATE TABLE IF NOT EXISTS business_connections (
-        connection_id TEXT PRIMARY KEY,
-        owner_id INTEGER NOT NULL,
-        is_enabled INTEGER NOT NULL DEFAULT 0,
-        updated_at INTEGER NOT NULL
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS business_message_metadata (
-        connection_id TEXT NOT NULL,
-        chat_id INTEGER NOT NULL,
-        message_id INTEGER NOT NULL,
-        sender_id INTEGER,
-        sender_name TEXT NOT NULL DEFAULT '',
-        sender_username TEXT,
-        is_incoming INTEGER NOT NULL DEFAULT 1,
-        message_text TEXT NOT NULL DEFAULT '',
-        media_signature TEXT NOT NULL DEFAULT '',
-        recorded_at INTEGER NOT NULL,
-        PRIMARY KEY (connection_id, chat_id, message_id)
-    )''')
-    c.execute("PRAGMA table_info(business_message_metadata)")
-    business_message_columns = {row[1] for row in c.fetchall()}
-    if "message_text" not in business_message_columns:
-        c.execute(
-            "ALTER TABLE business_message_metadata "
-            "ADD COLUMN message_text TEXT NOT NULL DEFAULT ''"
-        )
-    if "media_signature" not in business_message_columns:
-        c.execute(
-            "ALTER TABLE business_message_metadata "
-            "ADD COLUMN media_signature TEXT NOT NULL DEFAULT ''"
-        )
-    c.execute(
-        "CREATE INDEX IF NOT EXISTS idx_business_message_recorded_at "
-        "ON business_message_metadata(recorded_at)"
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+BUSINESS_METADATA_RETENTION_DAYS = 30
+BUSINESS_MESSAGE_MAX_CHARS = 3000
+NO_LOCAL_FILE_PREFIX = "file_id:"
+BUSINESS_MEDIA_DIR = Path(getattr(config, "BUSINESS_MEDIA_DIR", "business_media"))
+
+BUTTON_ICON_LABELS = {
+    "admin": "لوحة الإدارة",
+    "settings": "الإعدادات",
+    "moderation": "إدارة المستخدمين",
+    "stats": "الإحصائيات",
+    "broadcast": "البث",
+    "welcome": "تغيير رسالة الترحيب",
+    "ack": "تغيير رسالة التأكيد",
+    "back": "رجوع",
+    "business": "ربط Telegram Business",
+}
+
+
+def admin_button(
+    text: str,
+    callback_data: str,
+    style: str = "primary",
+    icon_key=None,
+) -> InlineKeyboardButton:
+    """إنشاء زر لوحة الإدارة مع لون Telegram وأيقونة Premium اختيارية."""
+    kwargs = {"style": style}
+    if icon_key:
+        icon_id = get_setting(f"button_icon_{icon_key}")
+        if icon_id:
+            kwargs["icon_custom_emoji_id"] = icon_id
+    return InlineKeyboardButton(text, callback_data=callback_data, **kwargs)
+
+
+def extract_target_user_id(message_text: str) -> int:
+    """استخراج معرّف المستخدم بعد إزالة Telegram لوسوم التنسيق."""
+    match = re.search(
+        r"(?m)^\s*🆔\s*(?:الأيدي|ID)\s*:\s*`?(\d+)`?\s*$",
+        message_text or "",
     )
-    c.execute('''CREATE TABLE IF NOT EXISTS business_media_files (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        connection_id TEXT NOT NULL,
-        chat_id INTEGER NOT NULL,
-        message_id INTEGER NOT NULL,
-        file_path TEXT NOT NULL UNIQUE,
-        file_name TEXT,
-        mime_type TEXT,
-        file_size INTEGER,
-        recorded_at INTEGER NOT NULL
-    )''')
-    c.execute("PRAGMA table_info(business_media_files)")
-    business_media_columns = {row[1] for row in c.fetchall()}
-    if "media_type" not in business_media_columns:
-        c.execute("ALTER TABLE business_media_files ADD COLUMN media_type TEXT")
-    if "file_id" not in business_media_columns:
-        c.execute("ALTER TABLE business_media_files ADD COLUMN file_id TEXT")
-    c.execute(
-        "CREATE INDEX IF NOT EXISTS idx_business_media_recorded_at "
-        "ON business_media_files(recorded_at)"
-    )
-    # جدول الإعدادات
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )''')
-    # القيم الافتراضية
-    defaults = {
-        "welcome_message": "مرحبا بك في سايت عمو محمد",
-        "ack_message": "تم ارسال رسالتك انتظر يا حلو",
-        "force_channel": "",
-        "force_bot": "",
-        "broadcast_text": ""
-    }
-    for key, value in defaults.items():
-        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
-
-def get_setting(key):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def set_setting(key, value):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
-    conn.commit()
-    conn.close()
-
-def add_user(user_id, full_name, username):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO users (user_id, full_name, username) VALUES (?, ?, ?)", (user_id, full_name, username))
-    c.execute("UPDATE users SET full_name = ?, username = ? WHERE user_id = ?", (full_name, username, user_id))
-    conn.commit()
-    conn.close()
-
-def mark_user_start_notified(user_id):
-    """يرجع True مرة واحدة فقط عند أول أمر /start لهذا المستخدم."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "UPDATE users SET start_notified = 1 WHERE user_id = ? AND start_notified = 0",
-        (user_id,),
-    )
-    is_first_start = c.rowcount == 1
-    conn.commit()
-    conn.close()
-    return is_first_start
-
-def increment_message_count(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE users SET messages_count = messages_count + 1 WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def get_user(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    user = c.fetchone()
-    conn.close()
-    return user
-
-def get_user_gender(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT gender FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def set_user_gender(user_id, gender):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE users SET gender = ? WHERE user_id = ?", (gender, user_id))
-    conn.commit()
-    conn.close()
-
-def save_message_target(chat_id, message_id, user_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO message_targets (chat_id, message_id, user_id) VALUES (?, ?, ?)",
-        (chat_id, message_id, user_id),
-    )
-    conn.commit()
-    conn.close()
-
-def get_message_target(chat_id, message_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "SELECT user_id FROM message_targets WHERE chat_id = ? AND message_id = ?",
-        (chat_id, message_id),
-    )
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-def set_user_status(user_id, status_type, value):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    col = "is_banned" if status_type == "ban" else "is_restricted"
-    c.execute(f"UPDATE users SET {col} = ? WHERE user_id = ?", (value, user_id))
-    conn.commit()
-    conn.close()
-
-def get_all_users():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users")
-    users = c.fetchall()
-    conn.close()
-    return [u[0] for u in users]
+    if not match:
+        raise ValueError("لم يتم العثور على أيدي المستخدم في الرسالة.")
+    return int(match.group(1))
 
 
-# Telegram Business connection state and minimal message metadata.
-def save_business_connection(connection_id, owner_id, is_enabled):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO business_connections "
-        "(connection_id, owner_id, is_enabled, updated_at) VALUES (?, ?, ?, ?)",
-        (connection_id, owner_id, int(bool(is_enabled)), int(time.time())),
-    )
-    conn.commit()
-    conn.close()
+def get_target_user_id_from_message(message) -> int:
+    """استخراج المستخدم من بطاقة المعلومات أو من رسالة المحتوى المرتبطة بها."""
+    try:
+        return extract_target_user_id(message.text or message.caption or "")
+    except ValueError:
+        target_id = get_message_target(message.chat_id, message.message_id)
+        if target_id is None:
+            raise
+        return target_id
 
 
-def get_business_connection(connection_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "SELECT owner_id, is_enabled FROM business_connections WHERE connection_id = ?",
-        (connection_id,),
-    )
-    row = c.fetchone()
-    conn.close()
-    if row is None:
-        return None
-    return {"owner_id": row[0], "is_enabled": bool(row[1])}
-
-
-def count_active_business_connections(owner_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "SELECT COUNT(*) FROM business_connections "
-        "WHERE owner_id = ? AND is_enabled = 1",
-        (owner_id,),
-    )
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else 0
-
-
-def save_business_message_metadata(
-    connection_id,
-    chat_id,
-    message_id,
-    sender_id,
-    sender_name,
-    sender_username,
-    is_incoming,
-    message_text="",
-    media_signature="",
-    recorded_at=None,
-):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR REPLACE INTO business_message_metadata "
-        "(connection_id, chat_id, message_id, sender_id, sender_name, "
-        "sender_username, is_incoming, message_text, media_signature, recorded_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            connection_id,
-            chat_id,
-            message_id,
-            sender_id,
-            sender_name or "",
-            sender_username,
-            int(bool(is_incoming)),
-            message_text or "",
-            media_signature or "",
-            int(recorded_at if recorded_at is not None else time.time()),
+def gender_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("ذكر", callback_data="set_gender:male"),
+        InlineKeyboardButton(
+            "أنثى",
+            callback_data="set_gender:female",
+            style="danger",
         ),
+    ]])
+
+
+async def prompt_for_gender(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="قبل إرسال الرسائل، اختر الجنس من الأزرار:",
+        reply_markup=gender_keyboard(),
     )
-    conn.commit()
-    conn.close()
 
 
-def get_business_message_metadata(connection_id, chat_id, message_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "SELECT sender_id, sender_name, sender_username, is_incoming, "
-        "message_text, media_signature "
-        "FROM business_message_metadata "
-        "WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
-        (connection_id, chat_id, message_id),
-    )
-    row = c.fetchone()
-    conn.close()
-    if row is None:
-        return None
-    return {
-        "sender_id": row[0],
-        "sender_name": row[1],
-        "sender_username": row[2],
-        "is_incoming": bool(row[3]),
-        "message_text": row[4],
-        "media_signature": row[5],
-    }
-
-
-def add_business_media_file(
-    connection_id,
-    chat_id,
-    message_id,
-    file_path,
-    file_name=None,
-    mime_type=None,
-    file_size=None,
-    recorded_at=None,
-    media_type=None,
-    file_id=None,
+async def notify_new_group_members(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "INSERT OR IGNORE INTO business_media_files "
-        "(connection_id, chat_id, message_id, file_path, file_name, "
-        "mime_type, file_size, recorded_at, media_type, file_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            connection_id,
-            chat_id,
-            message_id,
-            file_path,
-            file_name,
-            mime_type,
-            file_size,
-            int(recorded_at if recorded_at is not None else time.time()),
-            media_type,
-            file_id,
-        ),
-    )
-    conn.commit()
-    conn.close()
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
 
-
-def get_business_media_files(connection_id, chat_id, message_id):
-    """Return archived attachments saved for one Business message."""
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "SELECT file_path, file_name, mime_type, media_type, file_id "
-        "FROM business_media_files "
-        "WHERE connection_id = ? AND chat_id = ? AND message_id = ? "
-        "ORDER BY id",
-        (connection_id, chat_id, message_id),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return [
-        {
-            "file_path": row[0],
-            "file_name": row[1],
-            "mime_type": row[2],
-            "media_type": row[3],
-            "file_id": row[4],
-        }
-        for row in rows
+    members = [
+        member
+        for member in (message.new_chat_members or [])
+        if member.id != context.bot.id
     ]
+    if not members:
+        return
 
+    group_title = html_escape((chat.title or str(chat.id)).replace("\n", " "))
+    member_lines = []
+    for member in members:
+        name = html_escape(member.full_name.replace("\n", " "))
+        username = (
+            f"@{html_escape(member.username)}"
+            if member.username
+            else "بدون اسم مستخدم"
+        )
+        member_lines.append(
+            f"• {name} ({username}) — <code>{member.id}</code>"
+        )
 
-def get_expired_business_media_files(retention_days):
-    cutoff = int(time.time()) - max(1, int(retention_days)) * 86400
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "SELECT file_path FROM business_media_files WHERE recorded_at < ?",
-        (cutoff,),
+    await context.bot.send_message(
+        chat_id=config.OWNER_ID,
+        text=(
+            f"🔔 انضم عضو جديد إلى المجموعة <b>{group_title}</b>:\n"
+            + "\n".join(member_lines)
+        ),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
     )
-    paths = [row[0] for row in c.fetchall()]
-    conn.close()
-    return paths
 
 
-def delete_business_media_file(file_path):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("DELETE FROM business_media_files WHERE file_path = ?", (file_path,))
-    conn.commit()
-    conn.close()
+def is_owner(update: Update) -> bool:
+    user = update.effective_user
+    return user is not None and user.id == config.OWNER_ID
 
 
-def delete_business_message_metadata(connection_id, chat_id, message_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "DELETE FROM business_message_metadata "
-        "WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
-        (connection_id, chat_id, message_id),
+async def reject_non_owner_callback(update: Update) -> bool:
+    if is_owner(update):
+        return False
+    await update.callback_query.answer("هذه اللوحة للمالك فقط.", show_alert=True)
+    return True
+
+
+async def send_configured_message(
+    chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    message_key: str,
+    reply_markup=None,
+):
+    """إرسال النص بتنسيقه المحفوظ ثم إعادة توجيه ملصقه إن وجد."""
+    text = get_setting(f"{message_key}_message") or ""
+    raw_entities = get_setting(f"{message_key}_entities")
+    sticker_chat_id = get_setting(f"{message_key}_sticker_chat_id")
+    sticker_message_id = get_setting(f"{message_key}_sticker_message_id")
+
+    if raw_entities is None and text:
+        # تنسيق أوضح للرسائل القديمة التي لم تكن تحفظ كيانات التنسيق.
+        text_length = len(text.encode("utf-16-le")) // 2
+        entities = [
+            MessageEntity(
+                type=MessageEntity.BOLD,
+                offset=0,
+                length=text_length,
+            )
+        ]
+    else:
+        try:
+            saved_entities = json.loads(raw_entities or "[]")
+            if not isinstance(saved_entities, list):
+                raise ValueError("قائمة الكيانات المحفوظة غير صالحة")
+            entities = [
+                MessageEntity.de_json(entity, context.bot)
+                for entity in saved_entities
+            ]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("تنسيق محفوظ غير صالح للرسالة الثابتة %s", message_key)
+            entities = []
+
+    if text:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                entities=entities or None,
+                reply_markup=reply_markup,
+            )
+        except BadRequest:
+            if not entities:
+                raise
+            logger.warning(
+                "تعذر إرسال تنسيق الرسالة %s؛ سيُرسل النص دون تنسيق",
+                message_key,
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
+    elif reply_markup:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="لوحة تحكم المالك:",
+            reply_markup=reply_markup,
+        )
+
+    if sticker_chat_id and sticker_message_id:
+        try:
+            await context.bot.forward_message(
+                chat_id=chat_id,
+                from_chat_id=int(sticker_chat_id),
+                message_id=int(sticker_message_id),
+            )
+        except Exception:
+            logger.exception("تعذّر إعادة توجيه ملصق الرسالة الثابتة %s", message_key)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="تعذّر إرسال الملصق المحفوظ.",
+            )
+
+
+async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """التحقق من الاشتراك في القناة والبوت الإجباري"""
+    user_id = update.effective_user.id
+    force_channel = get_setting("force_channel")
+    force_bot = get_setting("force_bot")
+    
+    if force_channel:
+        try:
+            member = await context.bot.get_chat_member(chat_id=force_channel, user_id=user_id)
+            if member.status in ['left', 'kicked']:
+                await update.message.reply_text(f"عذراً، يجب عليك الاشتراك في القناة أولاً:\n{force_channel}")
+                return False
+        except Exception:
+            pass
+    
+    if force_bot:
+        # التحقق من بدء البوت الإجباري (يمكن تنفيذه عبر getChat أو إرسال رسالة تجريبية)
+        try:
+            await context.bot.get_chat(force_bot)
+        except Exception:
+            pass
+    
+    return True
+
+# --- أوامر المستخدم ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    add_user(user.id, user.full_name, user.username)
+
+    if user.id != config.OWNER_ID and mark_user_start_notified(user.id):
+        owner_message = (
+            "🔔 <b>دخول عضو جديد لأول مرة</b>\n"
+            f"👤 الاسم: {html_escape(user.full_name)}\n"
+        )
+        if user.username:
+            owner_message += f"🔗 اسم المستخدم: @{html_escape(user.username)}\n"
+        owner_message += f"🆔 الأيدي: <code>{user.id}</code>"
+        try:
+            await context.bot.send_message(
+                chat_id=config.OWNER_ID,
+                text=owner_message,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            logger.exception("تعذّر إرسال إشعار أول دخول إلى المالك")
+
+    if not await is_subscribed(update, context):
+        return
+    
+    reply_markup = None
+    if is_owner(update):
+        reply_markup = InlineKeyboardMarkup([[
+            admin_button(
+                "👑 لوحة الإدارة",
+                callback_data="open_admin_panel",
+                icon_key="admin",
+            )
+        ]])
+    await send_configured_message(user.id, context, "welcome", reply_markup)
+    if not is_owner(update) and get_user_gender(user.id) is None:
+        await prompt_for_gender(user.id, context)
+
+
+async def set_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    gender = (query.data or "").partition(":")[2]
+    if user is None or gender not in {"male", "female"}:
+        await query.answer("الاختيار غير صالح.", show_alert=True)
+        return
+
+    add_user(user.id, user.full_name, user.username)
+    set_user_gender(user.id, gender)
+    await query.answer("تم حفظ اختيارك.")
+    await context.bot.send_message(
+        chat_id=user.id,
+        text="تم حفظ اختيارك. يمكنك الآن إرسال رسالتك.",
     )
-    conn.commit()
-    conn.close()
 
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    add_user(user.id, user.full_name, user.username)
+    
+    if not await is_subscribed(update, context):
+        return
+    
+    user_data = get_user(user.id)
+    if user_data and user_data[4] == 1:  # is_banned
+        await update.message.reply_text("أنت محظور من استخدام البوت.")
+        return
+    if user_data and user_data[5] == 1:  # is_restricted
+        await update.message.reply_text("أنت مقيد من إرسال الرسائل.")
+        return
 
-def delete_business_message_metadata_for_connection(connection_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "DELETE FROM business_message_metadata WHERE connection_id = ?",
-        (connection_id,),
+    gender = get_user_gender(user.id)
+    if gender not in {"male", "female"}:
+        await update.message.reply_text(
+            "اختر الجنس أولاً من الأزرار، ثم أعد إرسال رسالتك:",
+            reply_markup=gender_keyboard(),
+        )
+        return
+    
+    increment_message_count(user.id)
+    count = get_user(user.id)[3]
+    
+    # استخدم HTML مع تهريب النصوص حتى يبقى الاسم رابطاً آمناً والرسالة كما كتبها المستخدم.
+    owner_msg = f"🆔 الأيدي: <code>{user.id}</code>\n"
+    owner_msg += (
+        f'📩 رسالة جديدة من: <a href="tg://openmessage?user_id={user.id}">'
+        f"{html_escape(user.full_name)}</a>\n"
     )
-    conn.commit()
-    conn.close()
+    if user.username:
+        owner_msg += f"👤 اسم المستخدم: @{html_escape(user.username)}\n"
+    owner_msg += f"📊 عدد الرسائل: {count}\n"
+    owner_msg += f"⚧ الجنس: {'ذكر' if gender == 'male' else 'أنثى'}"
 
-
-def prune_business_message_metadata(retention_days):
-    cutoff = int(time.time()) - max(1, int(retention_days)) * 86400
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        "DELETE FROM business_message_metadata WHERE recorded_at < ?",
-        (cutoff,),
+    sender_info = await context.bot.send_message(
+        chat_id=config.OWNER_ID,
+        text=owner_msg,
+        parse_mode=ParseMode.HTML,
     )
-    conn.commit()
-    conn.close()
+    gendered_label = "رسالة الولد" if gender == "male" else "رسالة الاميرة"
+    if update.message.text is not None:
+        sender_message = await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text=f"<b>{gendered_label}:</b>\n{html_escape(update.message.text)}",
+            parse_mode=ParseMode.HTML,
+            reply_parameters=ReplyParameters(message_id=sender_info.message_id),
+        )
+        owner_message_id = sender_message.message_id
+    else:
+        # أي نوع آخر (صورة، ملصق، فيديو، صوت، ملف، موقع، جهة اتصال، استطلاع...)
+        # يُنسخ للمالك كما هو مع الحفاظ على الشرح (caption) إن وجد.
+        try:
+            copied = await context.bot.copy_message(
+                chat_id=config.OWNER_ID,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+                reply_parameters=ReplyParameters(message_id=sender_info.message_id),
+            )
+        except Exception:
+            logger.warning("copy_message failed; trying forward_message", exc_info=True)
+            copied = await context.bot.forward_message(
+                chat_id=config.OWNER_ID,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+            )
+        owner_message_id = copied.message_id
+    save_message_target(
+        config.OWNER_ID,
+        owner_message_id,
+        user.id,
+    )
+    
+    # إرسال رسالة التأكيد والملصق المحفوظ معها إن وجد.
+    await send_configured_message(user.id, context, "ack")
+
+# --- أوامر المالك ---
+
+async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(update):
+        if query:
+            await query.answer("هذه اللوحة للمالك فقط.", show_alert=True)
+        return
+    
+    keyboard = [
+        [admin_button("⚙️ الإعدادات", "settings", icon_key="settings")],
+        [admin_button(
+            "🛡 إدارة المستخدمين",
+            "moderation_help",
+            style="success",
+            icon_key="moderation",
+        )],
+        [admin_button(
+            "📊 إحصائيات",
+            "stats",
+            style="success",
+            icon_key="stats",
+        )],
+        [admin_button(
+            "🔗 ربط Telegram Business",
+            "business_link",
+            style="success",
+            icon_key="business",
+        )],
+        [admin_button("📢 إعداد رسالة عامة", "broadcast_setup", icon_key="broadcast")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if query:
+        await query.answer()
+        await query.edit_message_text("لوحة تحكم المالك:", reply_markup=reply_markup)
+    elif update.message:
+        await update.message.reply_text("لوحة تحكم المالك:", reply_markup=reply_markup)
+
+async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    
+    keyboard = [
+        [admin_button(
+            "✏️ تغيير رسالة الترحيب",
+            "edit_welcome",
+            icon_key="welcome",
+        )],
+        [admin_button(
+            "✏️ تغيير رسالة التأكيد",
+            "edit_ack",
+            icon_key="ack",
+        )],
+        [admin_button("📢 تعيين القناة الإجبارية", "set_channel")],
+        [admin_button("🤖 تعيين البوت الإجباري", "set_bot")],
+        [admin_button(
+            "🎨 تخصيص رموز الأزرار",
+            "button_icons",
+            style="success",
+        )],
+        [admin_button("🔙 رجوع", "back_owner", icon_key="back")]
+    ]
+    await query.edit_message_text("الإعدادات:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+
+async def business_link_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض خطوات الربط الرسمي وحالة اتصال Telegram Business للمالك فقط."""
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+
+    active_connections = count_active_business_connections(config.OWNER_ID)
+    if active_connections:
+        status_text = f"✅ يوجد اتصال نشط ({active_connections})."
+    else:
+        status_text = "⚪ لا يوجد اتصال Business نشط مسجل حتى الآن."
+
+    text = (
+        "🔗 ربط Telegram Business\n\n"
+        f"الحالة: {status_text}\n\n"
+        "الربط يتم داخل تطبيق Telegram، وليس عبر إدخال رمز دخول في البوت:\n"
+        "1) افتح Telegram > الإعدادات > Telegram Business / الأعمال.\n"
+        "2) افتح Chatbots / روبوتات المحادثة واختر هذا البوت.\n"
+        "3) إذا تريده لكل الناس، فعّل كل فئات المحادثات الخاصة المتاحة: القديمة والجديدة، "
+        "جهات الاتصال وغير جهات الاتصال، ولا تستثنِ أفرادًا. امنحه أقل الصلاحيات المعروضة. "
+        "لا تمنحه صلاحية الرد أو الحذف أو إدارة القصص لهذا التنبيه.\n"
+        "4) ارجع إلى هنا واضغط «تحديث حالة الربط». سيصل تأكيد عند استلام Telegram للاتصال.\n\n"
+        "🔒 الخصوصية: لا يرسل البوت تنبيهًا عند الرسائل الجديدة؛ يرسل تنبيهًا فقط "
+        "عند تعديل رسالة واردة أو حذفها، ويعرض النص قبل التعديل وبعده. "
+        "يحفظ نص الرسالة وملفاتها المرفقة محليًا لمدة 30 يومًا ثم يحذفها تلقائيًا.\n"
+        f"مسار حفظ الملفات: {BUSINESS_MEDIA_DIR}.\n"
+        "لا تشارك رمز Telegram أو كلمة المرور مع البوت أو أي شخص."
+    )
+    keyboard = [
+        [admin_button("🔄 تحديث حالة الربط", "business_status", style="success")],
+        [admin_button("🔙 رجوع", "back_owner", icon_key="back")],
+    ]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    connection = update.business_connection
+    if connection is None:
+        return
+
+    connected_user = getattr(connection, "user", None)
+    if connected_user is None or connected_user.id != config.OWNER_ID:
+        logger.warning("Ignoring a Telegram Business connection that does not belong to OWNER_ID")
+        return
+
+    is_enabled = bool(connection.is_enabled)
+    save_business_connection(connection.id, config.OWNER_ID, is_enabled)
+    if is_enabled:
+        text = (
+            "✅ تم تأكيد ربط Telegram Business.\n"
+            "سيعالج البوت أحداث الرسائل الواردة في المحادثات التي اخترتها، "
+            "ويرسل إشعارًا فقط عند تعديل رسالة أو حذفها. لا يرسل تنبيهًا عند الرسائل الجديدة."
+        )
+    else:
+        text = (
+            "ℹ️ تم إيقاف اتصال Telegram Business. توقفت التنبيهات الجديدة؛ "
+            "ستبقى الرسائل والملفات المؤرشفة حتى انتهاء مدة الاحتفاظ البالغة 30 يومًا."
+        )
+    try:
+        await context.bot.send_message(chat_id=config.OWNER_ID, text=text)
+    except Exception:
+        logger.exception("Could not notify the owner about a Business connection change")
+
+
+def _business_sender_label(metadata):
+    if metadata is None:
+        return "مرسل غير معروف (الرسالة خارج فترة السجل أو وصلت قبل الربط)"
+    label = metadata.get("sender_name") or "مستخدم Telegram"
+    username = metadata.get("sender_username")
+    if username:
+        label += f" (@{username})"
+    sender_id = metadata.get("sender_id")
+    if sender_id:
+        label += f" — ID: {sender_id}"
+    return label
+
+
+def _business_media_items(message):
+    """Return one downloadable file per attachment, preferring the largest photo."""
+    items = []
+    photos = getattr(message, "photo", None) or []
+    if photos:
+        items.append(("photo", max(
+            photos,
+            key=lambda item: (
+                getattr(item, "file_size", 0) or 0,
+                getattr(item, "width", 0) * getattr(item, "height", 0),
+            ),
+        )))
+
+    for media_type in (
+        "animation",
+        "audio",
+        "document",
+        "video",
+        "video_note",
+        "voice",
+        "sticker",
+    ):
+        attachment = getattr(message, media_type, None)
+        if attachment is not None:
+            items.append((media_type, attachment))
+
+    paid_media = getattr(message, "paid_media", None)
+    for paid_item in getattr(paid_media, "paid_media", []) or []:
+        for media_type in ("photo", "video"):
+            attachment = getattr(paid_item, media_type, None)
+            if attachment is not None:
+                items.append((media_type, attachment))
+
+    unique_items = []
+    seen = set()
+    for media_type, attachment in items:
+        identity = (
+            getattr(attachment, "file_unique_id", None)
+            or getattr(attachment, "file_id", None)
+        )
+        if identity and identity not in seen:
+            seen.add(identity)
+            unique_items.append((media_type, attachment))
+    return unique_items
+
+
+def _business_message_content(message, media_items):
+    if message.text is not None:
+        return message.text
+    if message.caption is not None:
+        return message.caption
+
+    labels = {
+        "photo": "صورة",
+        "animation": "رسوم متحركة",
+        "audio": "ملف صوتي",
+        "document": "ملف",
+        "video": "فيديو",
+        "video_note": "رسالة فيديو",
+        "voice": "رسالة صوتية",
+        "sticker": "ملصق",
+    }
+    if media_items:
+        attachments = "، ".join(labels.get(kind, "مرفق") for kind, _ in media_items)
+        return f"[رسالة تحتوي على {attachments}]"
+
+    # أنواع لا تحتوي ملفاً قابلاً للتنزيل لكنها قابلة للحذف.
+    if getattr(message, "location", None) is not None:
+        loc = message.location
+        return f"[موقع: {loc.latitude}, {loc.longitude}]"
+    if getattr(message, "venue", None) is not None:
+        return f"[مكان: {message.venue.title}]"
+    if getattr(message, "contact", None) is not None:
+        contact = message.contact
+        return f"[جهة اتصال: {contact.first_name} {contact.phone_number}]"
+    if getattr(message, "poll", None) is not None:
+        return f"[استطلاع: {message.poll.question}]"
+    if getattr(message, "dice", None) is not None:
+        return f"[لعبة {message.dice.emoji}: {message.dice.value}]"
+    if getattr(message, "game", None) is not None:
+        return f"[لعبة: {message.game.title}]"
+    return "[رسالة بدون نص]"
+
+
+def _business_media_signature(media_items):
+    identities = [
+        getattr(media, "file_unique_id", None)
+        or getattr(media, "file_id", "")
+        for _, media in media_items
+    ]
+    if not identities:
+        return ""
+    return hashlib.sha256("\0".join(identities).encode("utf-8")).hexdigest()
+
+
+def _business_media_extension(media_type, media):
+    original_name = getattr(media, "file_name", None)
+    if original_name:
+        suffix = Path(original_name).suffix
+        if suffix and len(suffix) <= 12 and suffix[1:].isalnum():
+            return suffix.lower()
+    guessed = mimetypes.guess_extension(getattr(media, "mime_type", None) or "")
+    if guessed:
+        return guessed
+    return {
+        "photo": ".jpg",
+        "video": ".mp4",
+        "video_note": ".mp4",
+        "animation": ".mp4",
+        "voice": ".ogg",
+        "audio": ".mp3",
+        "sticker": ".webp",
+    }.get(media_type, ".bin")
+
+
+async def archive_business_media(message, context, media_items):
+    """Download supported Telegram attachments into the 30-day local archive."""
+    if not media_items:
+        return
+
+    try:
+        BUSINESS_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Could not create Telegram Business media archive directory (error=%s)",
+            type(exc).__name__,
+        )
+        return
+
+    for media_type, media in media_items:
+        file_id = getattr(media, "file_id", None)
+        if not file_id:
+            continue
+
+        destination = BUSINESS_MEDIA_DIR / (
+            f"{uuid.uuid4().hex}{_business_media_extension(media_type, media)}"
+        )
+        common = dict(
+            connection_id=message.business_connection_id,
+            chat_id=message.chat.id,
+            message_id=message.message_id,
+            file_name=Path(getattr(media, "file_name", "") or "").name or None,
+            mime_type=getattr(media, "mime_type", None),
+            file_size=getattr(media, "file_size", None),
+            media_type=media_type,
+            file_id=file_id,
+        )
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            await telegram_file.download_to_drive(custom_path=str(destination))
+            add_business_media_file(file_path=str(destination.resolve()), **common)
+        except Exception as exc:
+            logger.warning(
+                "Could not archive Telegram Business attachment "
+                "(message_id=%s, media_type=%s, error=%s)",
+                message.message_id,
+                media_type,
+                type(exc).__name__,
+            )
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+            # حتى لو فشل التنزيل (ملف كبير مثلاً) نحفظ file_id لإعادة إرساله لاحقاً.
+            add_business_media_file(
+                file_path=f"{NO_LOCAL_FILE_PREFIX}{uuid.uuid4().hex}", **common
+            )
+
+
+def prune_business_archive():
+    prune_business_message_metadata(BUSINESS_METADATA_RETENTION_DAYS)
+    media_root = BUSINESS_MEDIA_DIR.resolve()
+    for media_path in get_expired_business_media_files(
+        BUSINESS_METADATA_RETENTION_DAYS
+    ):
+        if media_path.startswith(NO_LOCAL_FILE_PREFIX):
+            delete_business_media_file(media_path)
+            continue
+        path = Path(media_path).resolve()
+        if media_root not in path.parents:
+            logger.error("Refusing to remove an archived media path outside the archive directory")
+            continue
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove an expired archived media file", exc_info=True)
+            continue
+        delete_business_media_file(media_path)
+
+
+def _clip_business_text(text):
+    if len(text) <= BUSINESS_MESSAGE_MAX_CHARS:
+        return text
+    return text[:BUSINESS_MESSAGE_MAX_CHARS] + "\n… (تم اختصار النص)"
+
+
+async def send_business_alert(context, text):
+    # Telegram limits a text message to 4096 characters; split long old/new pairs.
+    for offset in range(0, len(text), 3800):
+        await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text=text[offset:offset + 3800],
+        )
+
+
+_MEDIA_SENDERS = {
+    "photo": ("send_photo", "photo"),
+    "video": ("send_video", "video"),
+    "animation": ("send_animation", "animation"),
+    "audio": ("send_audio", "audio"),
+    "voice": ("send_voice", "voice"),
+    "video_note": ("send_video_note", "video_note"),
+    "sticker": ("send_sticker", "sticker"),
+    "document": ("send_document", "document"),
+}
+
+
+async def send_deleted_media(context, item):
+    """Send one archived attachment to the owner using its original type."""
+    method_name, arg_name = _MEDIA_SENDERS.get(
+        item.get("media_type"), ("send_document", "document")
+    )
+    sources = []
+    file_path = item.get("file_path") or ""
+    if file_path and not file_path.startswith(NO_LOCAL_FILE_PREFIX):
+        if Path(file_path).is_file():
+            sources.append("disk")
+    if item.get("file_id"):
+        sources.append("file_id")
+
+    for source in sources:
+        try:
+            method = getattr(context.bot, method_name)
+            if source == "disk":
+                with open(file_path, "rb") as handle:
+                    await method(chat_id=config.OWNER_ID, **{arg_name: handle})
+            else:
+                await method(chat_id=config.OWNER_ID, **{arg_name: item["file_id"]})
+            return
+        except Exception:
+            logger.warning(
+                "Could not resend deleted attachment as %s from %s",
+                item.get("media_type"),
+                source,
+                exc_info=True,
+            )
+
+    # آخر محاولة: إرساله كملف عادي من القرص.
+    try:
+        if "disk" in sources:
+            with open(file_path, "rb") as handle:
+                await context.bot.send_document(chat_id=config.OWNER_ID, document=handle)
+            return
+    except Exception:
+        logger.warning("Could not resend deleted attachment as a document", exc_info=True)
+    try:
+        await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text="⚠️ تعذّر استرجاع المرفق المحذوف (انتهى أو لم يُحفظ).",
+        )
+    except Exception:
+        logger.exception("Could not tell the owner an attachment was unavailable")
+
+
+async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    is_edit = update.edited_business_message is not None
+    message = update.edited_business_message or update.business_message
+    if message is None or not message.business_connection_id:
+        return
+
+    connection = get_business_connection(message.business_connection_id)
+    if (
+        connection is None
+        or connection["owner_id"] != config.OWNER_ID
+        or not connection["is_enabled"]
+    ):
+        return
+    if message.chat.type != "private":
+        return
+
+    sender = message.from_user
+    if sender is None:
+        return
+
+    # Track direction metadata so deletion alerts can ignore the owner's own messages.
+    is_incoming = (
+        sender.id != connection["owner_id"]
+        and getattr(message, "sender_business_bot", None) is None
+    )
+    previous = get_business_message_metadata(
+        message.business_connection_id,
+        message.chat.id,
+        message.message_id,
+    )
+    media_items = _business_media_items(message)
+    content = _business_message_content(message, media_items)
+    media_signature = _business_media_signature(media_items)
+    save_business_message_metadata(
+        connection_id=message.business_connection_id,
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+        sender_id=sender.id,
+        sender_name=sender.full_name,
+        sender_username=sender.username,
+        is_incoming=is_incoming,
+        message_text=content,
+        media_signature=media_signature,
+    )
+    await archive_business_media(message, context, media_items)
+    if not is_incoming:
+        return
+
+    # New messages are archived silently. Only edits and deletions notify the owner.
+    if not is_edit:
+        return
+
+    old_content = (
+        previous.get("message_text")
+        if previous and previous.get("message_text")
+        else "[النص السابق غير متوفر]"
+    )
+    media_changed = bool(
+        previous
+        and previous.get("media_signature")
+        and previous.get("media_signature") != media_signature
+    )
+    if media_changed:
+        old_content += "\n[المرفق السابق]"
+        content += "\n[تم تغيير المرفق]"
+    sender_label = sender.full_name or "مستخدم Telegram"
+    if sender.username:
+        sender_label += f" (@{sender.username})"
+    sender_label += f" — ID: {sender.id}"
+    lines = [
+        "✏️ تم تعديل رسالة واردة",
+        f"👤 {sender_label}",
+        "",
+        "قبل التعديل:",
+        _clip_business_text(old_content),
+        "",
+        "بعد التعديل:",
+        _clip_business_text(content),
+    ]
+    try:
+        await send_business_alert(context, "\n".join(lines))
+    except Exception:
+        logger.exception("Could not send a Business edit alert to the owner")
+
+
+async def handle_deleted_business_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    deleted = update.deleted_business_messages
+    if deleted is None:
+        return
+
+    connection = get_business_connection(deleted.business_connection_id)
+    if (
+        connection is None
+        or connection["owner_id"] != config.OWNER_ID
+        or not connection["is_enabled"]
+    ):
+        return
+
+    shown = 0
+    total_alerts = 0
+    for message_id in deleted.message_ids:
+        metadata = get_business_message_metadata(
+            deleted.business_connection_id,
+            deleted.chat.id,
+            message_id,
+        )
+        if metadata is not None and not metadata["is_incoming"]:
+            continue
+        total_alerts += 1
+        if shown >= 20:
+            continue
+        shown += 1
+
+        # بطاقة لكل رسالة محذوفة: المرسل + المحتوى المحذوف نفسه.
+        lines = [
+            "🗑️ تم حذف رسالة",
+            f"👤 {_business_sender_label(metadata)}",
+            f"🔢 رقم الرسالة: {message_id}",
+        ]
+        if metadata is not None:
+            lines.append("")
+            lines.append("المحتوى المحذوف:")
+            lines.append(_clip_business_text(metadata.get("message_text") or "[بدون نص]"))
+        else:
+            lines.append("")
+            lines.append("[المحتوى غير متوفر في السجل]")
+        try:
+            await send_business_alert(context, "\n".join(lines))
+        except Exception:
+            logger.exception("Could not send a Business deletion alert to the owner")
+
+        # إرسال كل المرفقات المحذوفة (صور، ملصقات، فيديو، صوت، ملفات...).
+        for item in get_business_media_files(
+            deleted.business_connection_id, deleted.chat.id, message_id
+        ):
+            await send_deleted_media(context, item)
+
+    remaining = max(0, total_alerts - shown)
+    if remaining:
+        try:
+            await send_business_alert(
+                context, f"🗑️ توجد {remaining} رسائل محذوفة أخرى لم تُعرض."
+            )
+        except Exception:
+            logger.exception("Could not send the extra deletion count to the owner")
+
+
+async def cleanup_business_message_metadata(context: ContextTypes.DEFAULT_TYPE):
+    prune_business_archive()
+
+
+async def handle_business_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route only official Telegram Business updates; other bot updates are ignored."""
+    if update.business_connection is not None:
+        await handle_business_connection(update, context)
+    elif (
+        update.business_message is not None
+        or update.edited_business_message is not None
+    ):
+        await handle_business_message(update, context)
+    elif update.deleted_business_messages is not None:
+        await handle_deleted_business_messages(update, context)
+
+
+async def button_icons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+
+    keyboard = [
+        [
+            admin_button(
+                f"✨ {label}",
+                f"set_button_icon:{key}",
+                icon_key=key,
+            )
+        ]
+        for key, label in BUTTON_ICON_LABELS.items()
+    ]
+    keyboard.append([
+        admin_button("🔙 رجوع للإعدادات", "settings", icon_key="settings")
+    ])
+    await query.edit_message_text(
+        "اختر الزر الذي تريد تخصيص أيقونته، ثم أرسل إيموجي Premium واحدًا. "
+        "لإزالة الأيقونة، أرسل كلمة «حذف».",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def set_button_icon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+
+    target = (query.data or "").partition(":")[2]
+    if target not in BUTTON_ICON_LABELS:
+        await query.answer("الزر غير معروف.", show_alert=True)
+        return
+
+    await query.answer()
+    context.user_data["expecting"] = "button_icon"
+    context.user_data["button_icon_target"] = target
+    await query.edit_message_text(
+        f"أرسل إيموجي Premium مخصصًا لأيقونة «{BUTTON_ICON_LABELS[target]}»، "
+        "أو أرسل «حذف» لإزالة الأيقونة الحالية."
+    )
+
+
+async def moderation_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    keyboard = [[admin_button("🔙 رجوع", "back_owner", icon_key="back")]]
+    text = (
+        "🛡 إدارة المستخدمين\n\n"
+        "للتحكم بمستخدم، ردّ على إشعار رسالته بأحد الأوامر:\n"
+        "/ban — حظر\n"
+        "/unban — رفع الحظر\n"
+        "/restrict — تقييد\n"
+        "/unrestrict — رفع التقييد\n"
+        "/stats — عرض الإحصائيات\n\n"
+        "هذه الأوامر متاحة للمالك فقط."
+    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def owner_stats_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    keyboard = [[admin_button("🔙 رجوع", "back_owner", icon_key="back")]]
+    await query.edit_message_text(
+        f"📊 إحصائيات البوت\nالمستخدمون المسجلون: {len(get_all_users())}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def broadcast_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    context.user_data["expecting"] = "broadcast"
+    keyboard = [[admin_button("🔙 رجوع", "back_owner", icon_key="back")]]
+    await query.edit_message_text(
+        "أرسل نص الرسالة العامة لحفظها. بعد الحفظ، أرسل /broadcast لإرسالها للمستخدمين.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_owner_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عندما يرد المالك على رسالة، تصل للمستخدم الأصلي"""
+    if update.effective_user.id != config.OWNER_ID:
+        return
+
+    expecting = context.user_data.get("expecting")
+    if expecting and update.message.reply_to_message:
+        try:
+            get_target_user_id_from_message(update.message.reply_to_message)
+        except ValueError:
+            await handle_expecting_input(update, context)
+            return
+
+    if not update.message.reply_to_message:
+        await handle_expecting_input(update, context)
+        return
+    
+    original_msg = update.message.reply_to_message
+    try:
+        target_id = get_target_user_id_from_message(original_msg)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ لم أجد أيدي المستخدم في الرسالة التي رددت عليها. "
+            "ردّ على إشعار رسالة المستخدم الذي أرسله البوت."
+        )
+        return
+
+    try:
+        if update.message.text is not None:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=update.message.text,
+            )
+        else:
+            await context.bot.forward_message(
+                chat_id=target_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+            )
+    except Exception:
+        logger.exception("تعذّر إرسال رد المالك إلى المستخدم %s", target_id)
+        await update.message.reply_text(
+            "❌ تعذّر إرسال الرد للمستخدم. قد يكون قد حظر البوت أو أوقف المحادثة."
+        )
+        return
+
+    await update.message.reply_text("✅ تم إرسال الرد للمستخدم.")
+
+# --- أوامر الحظر والتقييد ---
+
+async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("قم بالرد على رسالة المستخدم لتنفيذ الأمر.")
+        return
+    
+    try:
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
+        
+        set_user_status(target_id, "ban", 1)
+        await update.message.reply_text(f"✅ تم حظر المستخدم `{target_id}`.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ: {e}")
+
+async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("قم بالرد على رسالة المستخدم.")
+        return
+    
+    try:
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
+        
+        set_user_status(target_id, "ban", 0)
+        await update.message.reply_text(f"✅ تم رفع الحظر عن `{target_id}`.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ: {e}")
+
+async def restrict_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("قم بالرد على رسالة المستخدم.")
+        return
+    
+    try:
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
+        
+        set_user_status(target_id, "restrict", 1)
+        await update.message.reply_text(f"✅ تم تقييد المستخدم `{target_id}`.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ: {e}")
+
+async def unrestrict_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("قم بالرد على رسالة المستخدم.")
+        return
+    
+    try:
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
+        
+        set_user_status(target_id, "restrict", 0)
+        await update.message.reply_text(f"✅ تم رفع التقييد عن `{target_id}`.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ: {e}")
+
+async def user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
+        return
+    if not update.message.reply_to_message:
+        await update.message.reply_text("قم بالرد على رسالة المستخدم.")
+        return
+    
+    try:
+        target_id = get_target_user_id_from_message(update.message.reply_to_message)
+        
+        user = get_user(target_id)
+        if user:
+            await update.message.reply_text(f"📊 عدد رسائل المستخدم `{target_id}`: {user[3]}")
+        else:
+            await update.message.reply_text("المستخدم غير موجود في قاعدة البيانات.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ خطأ: {e}")
+
+# --- إعدادات النصوص عبر المحادثة ---
+
+async def edit_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    await query.edit_message_text(
+        "أرسل نص الترحيب مع التنسيق والإيموجي المخصص الذي تريده، "
+        "أو أرسل ملصقًا لإضافته إلى رسالة الترحيب."
+    )
+    context.user_data['expecting'] = 'welcome'
+
+async def edit_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    await query.edit_message_text(
+        "أرسل نص التأكيد مع التنسيق والإيموجي المخصص الذي تريده، "
+        "أو أرسل ملصقًا لإضافته إلى رسالة التأكيد."
+    )
+    context.user_data['expecting'] = 'ack'
+
+async def set_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    await query.edit_message_text("أرسل معرف القناة (مثال: @channelusername) أو أيديها:")
+    context.user_data['expecting'] = 'channel'
+
+async def set_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if await reject_non_owner_callback(update):
+        return
+    await query.answer()
+    await query.edit_message_text("أرسل معرف البوت الإجباري (مثال: @botusername):")
+    context.user_data['expecting'] = 'bot'
+
+async def handle_expecting_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة النصوص المدخلة من المالك لتغيير الإعدادات"""
+    if update.effective_user.id != config.OWNER_ID:
+        return
+    expecting = context.user_data.get('expecting')
+    if not expecting:
+        return
+
+    if expecting == "button_icon":
+        target = context.user_data.get("button_icon_target")
+        if target not in BUTTON_ICON_LABELS:
+            context.user_data.pop("expecting", None)
+            context.user_data.pop("button_icon_target", None)
+            await update.message.reply_text(
+                "❌ انتهت جلسة تخصيص الأيقونة. افتح إعدادات الأزرار وحاول مجددًا."
+            )
+            return
+
+        if (update.message.text or "").strip() in {"حذف", "إزالة", "مسح"}:
+            set_setting(f"button_icon_{target}", "")
+            context.user_data.pop("expecting", None)
+            context.user_data.pop("button_icon_target", None)
+            await update.message.reply_text(
+                f"✅ تمت إزالة أيقونة زر «{BUTTON_ICON_LABELS[target]}»."
+            )
+            return
+
+        custom_emoji = next(
+            (
+                entity
+                for entity in (update.message.entities or [])
+                if entity.type == MessageEntity.CUSTOM_EMOJI
+                and entity.custom_emoji_id
+            ),
+            None,
+        )
+        if custom_emoji:
+            set_setting(
+                f"button_icon_{target}",
+                custom_emoji.custom_emoji_id,
+            )
+            context.user_data.pop("expecting", None)
+            context.user_data.pop("button_icon_target", None)
+            await update.message.reply_text(
+                f"✅ تم حفظ أيقونة Premium لزر «{BUTTON_ICON_LABELS[target]}»."
+            )
+            return
+
+        await update.message.reply_text(
+            "لم أجد إيموجي Premium مخصصًا في رسالتك. أرسل إيموجي Premium واحدًا "
+            "أو أرسل «حذف» لإزالة الأيقونة."
+        )
+        return
+
+    if expecting in ('welcome', 'ack') and update.message.sticker:
+        set_setting(
+            f"{expecting}_sticker_chat_id",
+            str(update.effective_chat.id),
+        )
+        set_setting(
+            f"{expecting}_sticker_message_id",
+            str(update.message.message_id),
+        )
+        label = "الترحيب" if expecting == "welcome" else "التأكيد"
+        await update.message.reply_text(
+            f"✅ تمت إضافة الملصق إلى رسالة {label}، وسيعيد البوت توجيه الملصق الأصلي."
+        )
+        del context.user_data['expecting']
+        return
+    
+    text = update.message.text
+    if text is None:
+        await update.message.reply_text(
+            "أرسل نصًا، أو أرسل ملصقًا عند تعديل رسالة الترحيب أو التأكيد."
+        )
+        return
+    if expecting == 'welcome':
+        set_setting("welcome_message", text)
+        set_setting(
+            "welcome_entities",
+            json.dumps(
+                [entity.to_dict() for entity in (update.message.entities or [])],
+                ensure_ascii=False,
+            ),
+        )
+        set_setting("welcome_sticker_chat_id", "")
+        set_setting("welcome_sticker_message_id", "")
+        await update.message.reply_text(
+            "✅ تم تحديث رسالة الترحيب مع تنسيقها وإيموجيها المخصص."
+        )
+    elif expecting == 'ack':
+        set_setting("ack_message", text)
+        set_setting(
+            "ack_entities",
+            json.dumps(
+                [entity.to_dict() for entity in (update.message.entities or [])],
+                ensure_ascii=False,
+            ),
+        )
+        set_setting("ack_sticker_chat_id", "")
+        set_setting("ack_sticker_message_id", "")
+        await update.message.reply_text(
+            "✅ تم تحديث رسالة التأكيد مع تنسيقها وإيموجيها المخصص."
+        )
+    elif expecting == 'channel':
+        set_setting("force_channel", text)
+        await update.message.reply_text(f"✅ تم تعيين القناة الإجبارية: {text}")
+    elif expecting == 'bot':
+        set_setting("force_bot", text)
+        await update.message.reply_text(f"✅ تم تعيين البوت الإجباري: {text}")
+    elif expecting == 'broadcast':
+        set_setting("broadcast_text", text)
+        await update.message.reply_text(
+            "✅ تم حفظ الرسالة العامة. لإرسالها إلى المستخدمين، أرسل /broadcast."
+        )
+    
+    del context.user_data['expecting']
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
+        return
+    users = get_all_users()
+    msg = get_setting("broadcast_text")
+    if not msg:
+        await update.message.reply_text("لا توجد رسالة عامة محفوظة. استخدم /set_broadcast لتعيينها.")
+        return
+    
+    success = 0
+    for uid in users:
+        try:
+            await context.bot.send_message(chat_id=uid, text=msg)
+            success += 1
+        except Exception:
+            pass
+    await update.message.reply_text(f"✅ تم إرسال الرسالة إلى {success} مستخدم.")
+
+async def set_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != config.OWNER_ID:
+        return
+    context.user_data['expecting'] = 'broadcast'
+    await update.message.reply_text("أرسل نص الرسالة العامة:")
+
+# --- تشغيل البوت ---
+
+def main():
+    init_db()
+    prune_business_archive()
+    application = Application.builder().token(config.BOT_TOKEN).build()
+    if application.job_queue is not None:
+        application.job_queue.run_repeating(
+            cleanup_business_message_metadata,
+            interval=60 * 60,
+            first=60,
+            name="cleanup_business_archive",
+        )
+    
+    # أوامر المستخدم
+    application.add_handler(CommandHandler("start", start, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("admin", owner_panel, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(MessageHandler(
+        filters.UpdateType.MESSAGE & filters.StatusUpdate.NEW_CHAT_MEMBERS & filters.ChatType.GROUPS,
+        notify_new_group_members,
+    ))
+    application.add_handler(MessageHandler(
+        filters.UpdateType.MESSAGE
+        & filters.TEXT
+        & filters.User(config.OWNER_ID)
+        & filters.Regex(r"(?i)^\s*(?:/admin(?:@\w+)?|ادمن|أدمن)\s*$"),
+        owner_panel,
+    ))
+    application.add_handler(MessageHandler(
+        filters.UpdateType.MESSAGE
+        & filters.ALL
+        & ~filters.COMMAND
+        & filters.User(config.OWNER_ID),
+        handle_owner_reply,
+    ))
+    application.add_handler(MessageHandler(
+        filters.UpdateType.MESSAGE
+        & filters.ALL
+        & ~filters.COMMAND
+        & ~filters.StatusUpdate.ALL
+        & filters.ChatType.PRIVATE,
+        handle_user_message,
+    ))
+    
+    # أوامر المالك
+    application.add_handler(CommandHandler("owner", owner_panel, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("ban", ban_user, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("unban", unban_user, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("restrict", restrict_user, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("unrestrict", unrestrict_user, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("stats", user_stats, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("set_broadcast", set_broadcast, filters=filters.UpdateType.MESSAGE))
+    application.add_handler(CommandHandler("broadcast", broadcast, filters=filters.UpdateType.MESSAGE))
+    
+    # أزرار لوحة التحكم
+    application.add_handler(CallbackQueryHandler(owner_panel, pattern="^(?:open_admin_panel|back_owner)$"))
+    application.add_handler(CallbackQueryHandler(set_gender, pattern="^set_gender:"))
+    application.add_handler(CallbackQueryHandler(owner_stats_panel, pattern="^stats$"))
+    application.add_handler(CallbackQueryHandler(broadcast_setup, pattern="^broadcast_setup$"))
+    application.add_handler(CallbackQueryHandler(settings_menu, pattern="^settings$"))
+    application.add_handler(CallbackQueryHandler(button_icons_menu, pattern="^button_icons$"))
+    application.add_handler(CallbackQueryHandler(set_button_icon, pattern="^set_button_icon:"))
+    application.add_handler(CallbackQueryHandler(moderation_help, pattern="^moderation_help$"))
+    application.add_handler(CallbackQueryHandler(edit_welcome, pattern="^edit_welcome$"))
+    application.add_handler(CallbackQueryHandler(edit_ack, pattern="^edit_ack$"))
+    application.add_handler(CallbackQueryHandler(set_channel, pattern="^set_channel$"))
+    application.add_handler(CallbackQueryHandler(set_bot, pattern="^set_bot$"))
+    application.add_handler(
+        CallbackQueryHandler(
+            business_link_menu,
+            pattern="^(?:business_link|business_status)$",
+        )
+    )
+
+    # Process Telegram Business updates in a separate group so ordinary bot
+    # commands and anonymous-message handling never consume personal-account updates.
+    application.add_handler(
+        TypeHandler(Update, handle_business_update),
+        group=1,
+    )
+    
+    print("البوت يعمل الآن...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
