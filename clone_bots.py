@@ -135,7 +135,15 @@ async def _send_text_entities(bot, chat_id, text, entities, reply_markup=None):
     except BadRequest:
         if not entities:
             raise
-        # الإيموجي المميز لا يعمل في كل البوتات؛ نرجع للنص العادي.
+        # الإيموجي المميز لا يعمل في كل البوتات: نحذفه فقط ونُبقي الروابط والتنسيق.
+        safe = [e for e in entities if getattr(e, "type", None) != "custom_emoji"]
+        if safe and len(safe) != len(entities):
+            try:
+                return await bot.send_message(
+                    chat_id=chat_id, text=text, entities=safe, reply_markup=reply_markup
+                )
+            except BadRequest:
+                pass
         return await bot.send_message(
             chat_id=chat_id, text=text, reply_markup=reply_markup
         )
@@ -166,8 +174,10 @@ def _gender_cfg(bot_id):
 
 async def _send_cfg(bot, chat_id, bot_id, name, reply_markup=None):
     text, raw = get_clone_text(bot_id, name)
-    text = controls.with_signature(text)   # يضيف التوقيع في النهاية فقط إن كان مفعّلاً
-    await _send_text_entities(bot, chat_id, text, _parse_entities(raw, bot), reply_markup)
+    entities = _parse_entities(raw, bot)
+    # التوقيع (إن كان مفعّلاً) يُلصق في النهاية مع روابطه وتنسيقه، وزره اختياري.
+    text, entities = controls.apply_signature(text, entities, bot)
+    await _send_text_entities(bot, chat_id, text, entities, controls.signature_markup(reply_markup))
 
 
 # ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@
 """
 import asyncio
 import gzip
+import json
 import logging
 import os
 import shutil
@@ -23,7 +24,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
 from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, filters
 
@@ -98,9 +99,14 @@ async def guard(context, user, chat_id, bot_key):
     if user is None or user.id == config.OWNER_ID:
         return True
 
-    async def say(text):
+    async def say(text, entities=None):
         try:
-            await context.bot.send_message(chat_id or user.id, text)
+            await context.bot.send_message(chat_id or user.id, text, entities=entities)
+        except BadRequest:
+            try:   # تنسيق غير مدعوم في هذا البوت: نرسل النص بدونه
+                await context.bot.send_message(chat_id or user.id, text)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -108,7 +114,10 @@ async def guard(context, user, chat_id, bot_key):
         await say("🚫 أنت محظور من استخدام البوت.")
         return False
     if on("maint"):
-        await say(db.get_setting("ct_maint_text") or DEFAULT_MAINT_TEXT)
+        await say(
+            db.get_setting("ct_maint_text") or DEFAULT_MAINT_TEXT,
+            parse_entities(db.get_setting("ct_maint_entities"), context.bot),
+        )
         return False
     if on("spam"):
         verdict = _spam_verdict(bot_key, user.id)
@@ -121,23 +130,75 @@ async def guard(context, user, chat_id, bot_key):
 
 
 # ---------------------------------------------------------------------------
+# تنسيق النص (روابط، إيموجي مميز، ...) وحفظه
+# ---------------------------------------------------------------------------
+def entities_json(message):
+    return json.dumps([e.to_dict() for e in (message.entities or [])], ensure_ascii=False)
+
+
+def parse_entities(raw, bot):
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return [MessageEntity.de_json(e, bot) for e in data] or None if isinstance(data, list) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _u16(text):
+    """طول النص بوحدات UTF-16 (هكذا يحسب تيليجرام مواضع التنسيق)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+# ---------------------------------------------------------------------------
 # التوقيع
 # ---------------------------------------------------------------------------
-def signature_text():
+def _signature():
+    """(النص، قائمة تنسيقه كقواميس). الافتراضي نص عادي فيه @يوزر (تيليجرام يحوله لرابط)."""
     if not on("sig"):
-        return ""
+        return "", []
     custom = db.get_setting("ct_sig_text")
     if custom:
-        return custom
+        try:
+            ents = json.loads(db.get_setting("ct_sig_entities") or "[]")
+        except json.JSONDecodeError:
+            ents = []
+        return custom, ents if isinstance(ents, list) else []
     try:
-        return f"🤖 صُنع بواسطة @{MAIN_BOT.username}"
+        return f"🤖 صُنع بواسطة @{MAIN_BOT.username}", []
     except Exception:
-        return ""
+        return "", []
 
 
-def with_signature(text):
-    sig = signature_text()
-    return f"{text}\n\n{sig}" if sig else text
+def apply_signature(text, entities, bot):
+    """يلصق التوقيع في آخر الرسالة مع إزاحة مواضع تنسيقه ودمجه مع تنسيق الرسالة الأصلي."""
+    sig, sig_ents = _signature()
+    if not sig:
+        return text, entities
+    prefix = f"{text}\n\n"
+    shift = _u16(prefix)
+    merged = list(entities or [])
+    for e in sig_ents:
+        try:
+            merged.append(MessageEntity.de_json({**e, "offset": e["offset"] + shift}, bot))
+        except Exception:
+            continue
+    return prefix + sig, merged or None
+
+
+def signature_markup(markup):
+    """يضيف زر رابط (اختياري) تحت الرسالة يفتح البوت الرئيسي لإنشاء بوت."""
+    label = db.get_setting("ct_sig_btn")
+    if not (on("sig") and label):
+        return markup
+    try:
+        url = f"https://t.me/{MAIN_BOT.username}"
+    except Exception:
+        return markup
+    rows = [list(r) for r in (markup.inline_keyboard if markup else [])]
+    rows.append([InlineKeyboardButton(label, url=url)])
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +390,7 @@ def menu():
         [_btn("💾 النسخ التلقائي", "cl_ct_t:backup"), _btn("⏱ تغيير المدة", "cl_ct_hrs"),
          _btn("📤 أرسل الآن", "cl_ct_bk", "success")],
         [_btn("✍️ التوقيع: تشغيل/إيقاف", "cl_ct_t:sig"), _btn("✏️ نص التوقيع", "cl_ct_in:sig")],
+        [_btn("🔘 زر تحت الرسالة", "cl_ct_in:sigbtn")],
         [_btn("🔗 الإحالة: تشغيل/إيقاف", "cl_ct_t:ref")],
         [_btn("📜 سجل النشاط", "cl_ct_log")],
         [_btn("🔙 رجوع", "back_owner")],
@@ -338,7 +400,11 @@ def menu():
 
 _PROMPTS = {
     "maint": "أرسل نص رسالة الصيانة التي تصل للأعضاء، أو «افتراضي».",
-    "sig": "أرسل نص التوقيع الذي يُضاف لرسائل البوتات المصنوعة، أو «افتراضي».",
+    "sig": ("أرسل نص التوقيع الذي يُضاف لرسائل البوتات المصنوعة، أو «افتراضي».\n"
+            "يمكنك استعمال التنسيق والروابط (اكتب النص ثم حدّده وأضف رابطاً من تنسيق تيليجرام) "
+            "وسيُحفظ كما هو."),
+    "sigbtn": ("أرسل نص زر الرابط الذي يظهر تحت رسائل البوتات المصنوعة ويفتح بوتك الرئيسي "
+               "(مثال: 🤖 أنشئ بوتك الآن)، أو «حذف» لإزالته."),
     "gban": "أرسل أيدي (أو @يوزر) العضو المراد حظره عاماً. يمكن عدة أيديات بمسافة بينها.",
     "ungban": "أرسل أيدي (أو @يوزر) العضو المراد رفع الحظر العام عنه.",
 }
@@ -407,10 +473,22 @@ async def main_input(update, context, expect):
         key = f"ct_{kind}_text"
         if text in ("افتراضي", "الافتراضي"):
             db.set_setting(key, "")
+            db.set_setting(f"ct_{kind}_entities", "")
             await msg.reply_text("✅ رجع النص للافتراضي.", reply_markup=back)
         else:
             db.set_setting(key, msg.text)
-            await msg.reply_text("✅ تم الحفظ.", reply_markup=back)
+            db.set_setting(f"ct_{kind}_entities", entities_json(msg))   # يحفظ الروابط والتنسيق
+            await msg.reply_text("✅ تم الحفظ مع التنسيق والروابط.", reply_markup=back)
+    elif kind == "sigbtn":
+        if text in ("حذف", "إزالة", "مسح"):
+            db.set_setting("ct_sig_btn", "")
+            await msg.reply_text("✅ حُذف الزر.", reply_markup=back)
+        elif len(text) > 40:
+            await msg.reply_text("النص طويل (الحد 40 حرفاً). أرسل نصاً أقصر.")
+            return False
+        else:
+            db.set_setting("ct_sig_btn", text)
+            await msg.reply_text("✅ تم الحفظ. يظهر الزر عندما يكون التوقيع مفعّلاً.", reply_markup=back)
     elif kind in ("gban", "ungban"):
         await msg.reply_text(_apply_ban(text, kind == "gban"), reply_markup=back)
     return True
