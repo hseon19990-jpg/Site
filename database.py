@@ -1,6 +1,6 @@
 import sqlite3
 import time
-from config import DB_NAME
+from config import DB_NAME, TOKEN_ENC_KEY
 
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -123,6 +123,49 @@ def init_db():
         user_id INTEGER NOT NULL,
         PRIMARY KEY (bot_id, chat_id, message_id)
     )''')
+    # --- الاشتراك الإجباري: scope = main (بوت المالك فقط) | global (كل البوتات) | clone (بوت صانع) ---
+    c.execute('''CREATE TABLE IF NOT EXISTS force_subs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT NOT NULL,
+        bot_id INTEGER NOT NULL DEFAULT 0,
+        kind TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        username TEXT,
+        title TEXT,
+        link TEXT,
+        created_at INTEGER NOT NULL,
+        UNIQUE (scope, bot_id, chat_id)
+    )''')
+    # القنوات والجروبات التي أُضيف إليها كل بوت (للإذاعة). bot_id = 0 للبوت الرئيسي.
+    c.execute('''CREATE TABLE IF NOT EXISTS known_chats (
+        bot_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        chat_type TEXT NOT NULL,
+        title TEXT,
+        can_post INTEGER NOT NULL DEFAULT 1,
+        PRIMARY KEY (bot_id, chat_id)
+    )''')
+    # --- مركز التحكم: حظر عام، سجل نشاط، إحالات ---
+    c.execute('''CREATE TABLE IF NOT EXISTS global_bans (
+        user_id INTEGER PRIMARY KEY,
+        reason TEXT,
+        created_at INTEGER NOT NULL
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS activity_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        actor INTEGER,
+        bot_id INTEGER NOT NULL DEFAULT 0,
+        action TEXT NOT NULL,
+        detail TEXT
+    )''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_activity_ts ON activity_log(ts)")
+    c.execute('''CREATE TABLE IF NOT EXISTS referrals (
+        user_id INTEGER PRIMARY KEY,
+        referrer_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    )''')
+    c.execute("CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id)")
     # جدول الإعدادات
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -140,6 +183,7 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
     conn.commit()
     conn.close()
+    migrate_tokens()
 
 def get_setting(key):
     conn = sqlite3.connect(DB_NAME)
@@ -465,13 +509,65 @@ def prune_business_message_metadata(retention_days):
 # ---------------------------------------------------------------------------
 # البوتات المصنوعة (قسم «قم بإنشاء بوت»)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# تشفير توكنات البوتات المصنوعة (اختياري: يعمل عند وضع TOKEN_ENC_KEY في .env)
+# ---------------------------------------------------------------------------
+_ENC_PREFIX = "enc:"
+_FERNET = None
+
+
+def _fernet():
+    global _FERNET
+    if _FERNET is None:
+        try:
+            from cryptography.fernet import Fernet
+        except ImportError as exc:
+            raise RuntimeError(
+                "TOKEN_ENC_KEY مضبوط لكن مكتبة cryptography غير مثبتة. نفّذ: pip install cryptography"
+            ) from exc
+        _FERNET = Fernet(TOKEN_ENC_KEY.encode())
+    return _FERNET
+
+
+def encrypt_token(token):
+    if not TOKEN_ENC_KEY or token.startswith(_ENC_PREFIX):
+        return token
+    return _ENC_PREFIX + _fernet().encrypt(token.encode()).decode()
+
+
+def decrypt_token(stored):
+    if not stored.startswith(_ENC_PREFIX):
+        return stored
+    if not TOKEN_ENC_KEY:
+        raise RuntimeError("توكنات البوتات مشفرة لكن TOKEN_ENC_KEY غير موجود في .env")
+    return _fernet().decrypt(stored[len(_ENC_PREFIX):].encode()).decode()
+
+
+def migrate_tokens():
+    """يشفّر التوكنات القديمة المحفوظة نصاً عادياً (مرة واحدة، فقط إن وُجد المفتاح)."""
+    if not TOKEN_ENC_KEY:
+        return
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        rows = conn.execute("SELECT bot_id, token FROM clone_bots").fetchall()
+        for bot_id, token in rows:
+            if not token.startswith(_ENC_PREFIX):
+                conn.execute(
+                    "UPDATE clone_bots SET token = ? WHERE bot_id = ?",
+                    (encrypt_token(token), bot_id),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _clone_row(row):
     if row is None:
         return None
     return {
         "bot_id": row[0],
         "owner_id": row[1],
-        "token": row[2],
+        "token": decrypt_token(row[2]),
         "username": row[3],
         "name": row[4],
         "is_active": bool(row[5]),
@@ -492,7 +588,7 @@ def save_clone(bot_id, owner_id, token, username, name):
             "VALUES (?, ?, ?, ?, ?, 1, ?) "
             "ON CONFLICT(bot_id) DO UPDATE SET token = excluded.token, "
             "username = excluded.username, name = excluded.name, is_active = 1",
-            (bot_id, owner_id, token, username, name, int(time.time())),
+            (bot_id, owner_id, encrypt_token(token), username, name, int(time.time())),
         )
         conn.commit()
     finally:
@@ -544,7 +640,8 @@ def delete_clone(bot_id):
     """يحذف البوت وكل أعضائه وإعداداته وروابط رسائله."""
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    for table in ("clone_users", "clone_settings", "clone_message_targets", "clone_bots"):
+    for table in ("clone_users", "clone_settings", "clone_message_targets",
+                  "force_subs", "known_chats", "clone_bots"):
         c.execute(f"DELETE FROM {table} WHERE bot_id = ?", (bot_id,))
     conn.commit()
     conn.close()
@@ -755,3 +852,258 @@ def clone_get_target(bot_id, chat_id, message_id):
     row = c.fetchone()
     conn.close()
     return row[0] if row else None
+
+
+
+# ---------------------------------------------------------------------------
+# الاشتراك الإجباري
+# ---------------------------------------------------------------------------
+_FS_COLS = "id, scope, bot_id, kind, chat_id, username, title, link"
+
+
+def _fs_row(r):
+    return {
+        "id": r[0], "scope": r[1], "bot_id": r[2], "kind": r[3],
+        "chat_id": r[4], "username": r[5], "title": r[6], "link": r[7],
+    }
+
+
+def add_force_sub(scope, bot_id, kind, chat_id, username, title, link):
+    """يضيف اشتراكاً إجبارياً. يرجع False إن كان موجوداً مسبقاً."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO force_subs "
+            "(scope, bot_id, kind, chat_id, username, title, link, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (scope, bot_id, kind, chat_id, username, title, link, int(time.time())),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def list_force_subs(scopes, bot_id=0):
+    """scopes: قائمة من main/global/clone. bot_id يخص scope=clone فقط."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        marks = ",".join("?" for _ in scopes)
+        rows = conn.execute(
+            f"SELECT {_FS_COLS} FROM force_subs "
+            f"WHERE scope IN ({marks}) AND (scope != 'clone' OR bot_id = ?) "
+            "ORDER BY id",
+            (*scopes, bot_id),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [_fs_row(r) for r in rows]
+
+
+def get_force_sub(sub_id):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        row = conn.execute(
+            f"SELECT {_FS_COLS} FROM force_subs WHERE id = ?", (sub_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return _fs_row(row) if row else None
+
+
+def delete_force_sub(sub_id):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute("DELETE FROM force_subs WHERE id = ?", (sub_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# القنوات والجروبات المعروفة لكل بوت (للإذاعة)
+# ---------------------------------------------------------------------------
+def upsert_known_chat(bot_id, chat_id, chat_type, title, can_post):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute(
+            "INSERT INTO known_chats (bot_id, chat_id, chat_type, title, can_post) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(bot_id, chat_id) DO UPDATE SET chat_type = excluded.chat_type, "
+            "title = excluded.title, can_post = excluded.can_post",
+            (bot_id, chat_id, chat_type, title, int(bool(can_post))),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_known_chat(bot_id, chat_id):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute(
+            "DELETE FROM known_chats WHERE bot_id = ? AND chat_id = ?", (bot_id, chat_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_known_chats(bot_id, postable_only=True):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        query = "SELECT chat_id FROM known_chats WHERE bot_id = ?"
+        if postable_only:
+            query += " AND can_post = 1"
+        return [r[0] for r in conn.execute(query, (bot_id,)).fetchall()]
+    finally:
+        conn.close()
+
+
+def ensure_known_chat(bot_id, chat_id, chat_type, title):
+    """يسجل القناة/الجروب إن لم يكن مسجلاً، ولا يغيّر صلاحية الإرسال المسجلة."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO known_chats (bot_id, chat_id, chat_type, title, can_post) "
+            "VALUES (?, ?, ?, ?, 1)",
+            (bot_id, chat_id, chat_type, title),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# الحظر العام (البوت الرئيسي + كل البوتات المصنوعة)
+# ---------------------------------------------------------------------------
+_GBANS = None
+
+
+def _gban_cache():
+    global _GBANS
+    if _GBANS is None:
+        conn = sqlite3.connect(DB_NAME)
+        try:
+            _GBANS = {r[0] for r in conn.execute("SELECT user_id FROM global_bans")}
+        finally:
+            conn.close()
+    return _GBANS
+
+
+def is_globally_banned(user_id):
+    return user_id in _gban_cache()
+
+
+def add_global_ban(user_id, reason=""):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO global_bans (user_id, reason, created_at) VALUES (?, ?, ?)",
+            (user_id, reason, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    _gban_cache().add(user_id)
+
+
+def remove_global_ban(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        cur = conn.execute("DELETE FROM global_bans WHERE user_id = ?", (user_id,))
+        conn.commit()
+        removed = cur.rowcount > 0
+    finally:
+        conn.close()
+    _gban_cache().discard(user_id)
+    return removed
+
+
+def count_global_bans():
+    return len(_gban_cache())
+
+
+def find_user_id_by_username(username):
+    """يبحث عن يوزر بين أعضاء السايت ثم أعضاء كل البوتات المصنوعة."""
+    name = username.lstrip("@").lower()
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        for table in ("users", "clone_users"):
+            row = conn.execute(
+                f"SELECT user_id FROM {table} WHERE LOWER(username) = ? LIMIT 1", (name,)
+            ).fetchone()
+            if row:
+                return row[0]
+    finally:
+        conn.close()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# سجل النشاط
+# ---------------------------------------------------------------------------
+def log_activity(action, actor=None, bot_id=0, detail=""):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        try:
+            conn.execute(
+                "INSERT INTO activity_log (ts, actor, bot_id, action, detail) VALUES (?, ?, ?, ?, ?)",
+                (int(time.time()), actor, bot_id, action, detail[:300]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass  # السجل لا يجب أن يعطّل أي عملية
+
+
+def recent_activity(limit=20):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        return conn.execute(
+            "SELECT ts, actor, bot_id, action, detail FROM activity_log "
+            "ORDER BY id DESC LIMIT ?", (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def prune_activity(days=60):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute("DELETE FROM activity_log WHERE ts < ?", (int(time.time()) - days * 86400,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# الإحالات
+# ---------------------------------------------------------------------------
+def add_referral(user_id, referrer_id):
+    """يسجّل الإحالة مرة واحدة لكل عضو، ويرفض الإحالة الذاتية. يرجع True إن سُجلت."""
+    if user_id == referrer_id:
+        return False
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO referrals (user_id, referrer_id, created_at) VALUES (?, ?, ?)",
+            (user_id, referrer_id, int(time.time())),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def count_referrals(referrer_id=None):
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        if referrer_id is None:
+            return conn.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
+        return conn.execute(
+            "SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (referrer_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()

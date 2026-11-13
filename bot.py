@@ -18,6 +18,8 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 import config
 import clone_bots
+import controls
+import force_sub
 from database import (
     init_db, get_setting, set_setting, add_user, mark_user_start_notified,
     increment_message_count, get_user, set_user_status, get_all_users,
@@ -239,28 +241,8 @@ async def send_configured_message(
 
 
 async def is_subscribed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """التحقق من الاشتراك في القناة والبوت الإجباري"""
-    user_id = update.effective_user.id
-    force_channel = get_setting("force_channel")
-    force_bot = get_setting("force_bot")
-    
-    if force_channel:
-        try:
-            member = await context.bot.get_chat_member(chat_id=force_channel, user_id=user_id)
-            if member.status in ['left', 'kicked']:
-                await update.message.reply_text(f"عذراً، يجب عليك الاشتراك في القناة أولاً:\n{force_channel}")
-                return False
-        except Exception:
-            pass
-    
-    if force_bot:
-        # التحقق من بدء البوت الإجباري (يمكن تنفيذه عبر getChat أو إرسال رسالة تجريبية)
-        try:
-            await context.bot.get_chat(force_bot)
-        except Exception:
-            pass
-    
-    return True
+    """الاشتراك الإجباري (إجباري المالك + الإجباري العام). المالك معفى."""
+    return await force_sub.gate(update, context)
 
 # --- أوامر المستخدم ---
 
@@ -268,7 +250,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     add_user(user.id, user.full_name, user.username)
 
-    if user.id != config.OWNER_ID and mark_user_start_notified(user.id):
+    first_time = user.id != config.OWNER_ID and mark_user_start_notified(user.id)
+    if first_time:
+        await controls.record_referral(context, user.id, context.args)
+    if first_time:
         owner_message = (
             "🔔 <b>دخول عضو جديد لأول مرة</b>\n"
             f"👤 الاسم: {html_escape(user.full_name)}\n"
@@ -433,6 +418,7 @@ async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             icon_key="business",
         )],
         [admin_button("🤖 البوتات المصنوعة", "cl_admin", style="success")],
+        [admin_button("🎛 مركز التحكم", "cl_ct", style="success")],
         [admin_button("📢 إعداد رسالة عامة", "broadcast_setup", icon_key="broadcast")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -459,8 +445,7 @@ async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "edit_ack",
             icon_key="ack",
         )],
-        [admin_button("📢 تعيين القناة الإجبارية", "set_channel")],
-        [admin_button("🤖 تعيين البوت الإجباري", "set_bot")],
+        [admin_button("🔒 الاشتراك الإجباري", "cl_fs", style="success")],
         [admin_button(
             "🎨 تخصيص رموز الأزرار",
             "button_icons",

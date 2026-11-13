@@ -3,7 +3,8 @@
 العضو يضغط الزر في البوت الرئيسي ويرسل توكن بوته، فيشغّل السايت له بوتاً
 مماثلاً داخل نفس العملية (process) بخصائص خاصة به:
   - حظر / إلغاء الحظر (بالرد أو بالأيدي أو باليوزر)
-  - إذاعة لأعضاء بوته
+  - إذاعة لأعضاء بوته أو لقنواته/جروباته (أو الاثنين)
+  - اشتراك إجباري (قناة / جروب / بوت، واحد أو أكثر)
   - تفعيل/إلغاء زر ولد وأميرة وتغيير نصوصهما
   - تغيير رسالة الترحيب ورسالة الإرسال
   - كليشات مجهزة من المالك تصل للجميع، وأي تعديل من صاحب البوت يبقى له.
@@ -31,7 +32,9 @@ from telegram.ext import (
 )
 
 import config
+import controls
 import database as db
+import force_sub
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ logger = logging.getLogger(__name__)
 RUNNING: dict = {}
 
 TOKEN_RE = re.compile(r"^\d{5,}:[A-Za-z0-9_-]{30,}$")
-CLONE_UPDATES = ["message", "callback_query"]
+CLONE_UPDATES = ["message", "callback_query", "my_chat_member", "channel_post"]
 
 CANCEL_WORDS = {"إلغاء", "الغاء", "/cancel", "cancel"}
 RESET_WORDS = {"افتراضي", "الافتراضي", "استرجاع"}
@@ -163,6 +166,7 @@ def _gender_cfg(bot_id):
 
 async def _send_cfg(bot, chat_id, bot_id, name, reply_markup=None):
     text, raw = get_clone_text(bot_id, name)
+    text = controls.with_signature(text)   # يضيف التوقيع في النهاية فقط إن كان مفعّلاً
     await _send_text_entities(bot, chat_id, text, _parse_entities(raw, bot), reply_markup)
 
 
@@ -279,6 +283,8 @@ async def _show_create_entry(context, user):
     if row and row[4] == 1:
         await context.bot.send_message(user.id, "أنت محظور من استخدام البوت.")
         return
+    if not await force_sub.gate_user(context, user):
+        return
 
     existing = db.get_clone_by_owner(user.id)
     if existing:
@@ -366,6 +372,7 @@ async def cl_delete_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await stop_clone(existing["bot_id"])
     db.delete_clone(existing["bot_id"])
+    db.log_activity("clone_deleted_by_owner", update.effective_user.id, existing["bot_id"], f"@{existing['username']}")
     await _edit(query, f"🗑 تم حذف البوت @{existing['username']}.")
 
 
@@ -430,6 +437,7 @@ async def _handle_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data.pop("cl_expect", None)
+    db.log_activity("clone_created" if is_new else "clone_token_updated", user.id, me.id, f"@{me.username}")
     await say(
         f"✅ تم {'إنشاء' if is_new else 'تحديث'} بوتك @{me.username} وهو يعمل الآن.\n\n"
         "1) افتح بوتك واضغط Start (مرة واحدة حتى تصلك الرسائل).\n"
@@ -511,22 +519,35 @@ async def _send_payload(bot, chat_id, payload, media) -> bool:
     return False
 
 
-async def _cascade_broadcast(main_bot, pending, scope):
+async def _cascade_broadcast(main_bot, pending, scope, where):
+    """scope: mine (بوتي فقط) | all (+ بوتات الصانعين). where: priv | chats | both."""
     payload = pending["payload"]
     src_chat, src_msg = pending["chat_id"], pending["message_id"]
     clones = db.list_clones(active_only=True)
+    do_priv = where in ("priv", "both")
+    do_chats = where in ("chats", "both")
 
-    # (1) أعضاء السايت + أصحاب البوتات عبر البوت الرئيسي.
-    main_ids = set(db.get_all_users()) | {c["owner_id"] for c in clones}
-    main_ids.discard(config.OWNER_ID)
-    main_ok = 0
-    for uid in main_ids:
-        if await _copy_with_retry(main_bot, uid, src_chat, src_msg):
-            main_ok += 1
-        await asyncio.sleep(0.05)
+    # (1) بوتي الرئيسي: الخاص (أعضاء السايت + أصحاب البوتات).
+    main_ids, main_ok = set(), 0
+    if do_priv:
+        main_ids = set(db.get_all_users()) | {c["owner_id"] for c in clones}
+        main_ids.discard(config.OWNER_ID)
+        for uid in main_ids:
+            if await _copy_with_retry(main_bot, uid, src_chat, src_msg):
+                main_ok += 1
+            await asyncio.sleep(0.05)
 
-    # (2) أعضاء كل بوت مصنوع عبر بوتهم نفسه.
-    members_ok = members_total = skipped = 0
+    # (2) بوتي الرئيسي: القنوات والجروبات التي هو مشرف/عضو فيها ويقدر يكتب.
+    main_chats, main_chats_ok = [], 0
+    if do_chats:
+        main_chats = db.list_known_chats(0)
+        for chat_id in main_chats:
+            if await _copy_with_retry(main_bot, chat_id, src_chat, src_msg):
+                main_chats_ok += 1
+            await asyncio.sleep(0.05)
+
+    # (3) البوتات المصنوعة: كل بوت يرسل بنفسه لأعضائه و/أو قنواته وجروباته.
+    members_ok = members_total = chats_ok = chats_total = skipped = 0
     media_note = ""
     if scope == "all" and payload:
         media = None
@@ -535,32 +556,46 @@ async def _cascade_broadcast(main_bot, pending, scope):
                 tg_file = await main_bot.get_file(payload["file_id"])
                 media = bytes(await tg_file.download_as_bytearray())
             except Exception:
-                media_note = "\n⚠️ تعذّر تنزيل المرفق (قد يكون كبيراً)، لم يُرسل لأعضاء البوتات."
+                media_note = "\n⚠️ تعذّر تنزيل المرفق (قد يكون كبيراً)، لم يُرسل عبر البوتات المصنوعة."
                 clones = []
 
         async def run(clone):
             app = RUNNING.get(clone["bot_id"])
-            ids = db.clone_user_ids(clone["bot_id"], exclude_user_id=clone["owner_id"])
+            ids = (
+                db.clone_user_ids(clone["bot_id"], exclude_user_id=clone["owner_id"])
+                if do_priv else []
+            )
+            chat_ids = db.list_known_chats(clone["bot_id"]) if do_chats else []
             if app is None:
-                return 0, len(ids), 1
-            ok = 0
+                return 0, len(ids), 0, len(chat_ids), 1
+            ok = chat_ok = 0
             for uid in ids:
                 if await _send_payload(app.bot, uid, payload, media):
                     ok += 1
                 await asyncio.sleep(0.05)
-            return ok, len(ids), 0
+            for chat_id in chat_ids:
+                if await _send_payload(app.bot, chat_id, payload, media):
+                    chat_ok += 1
+                await asyncio.sleep(0.05)
+            return ok, len(ids), chat_ok, len(chat_ids), 0
 
-        for ok, total, skip in await asyncio.gather(*(run(c) for c in clones)):
+        for ok, total, c_ok, c_total, skip in await asyncio.gather(*(run(c) for c in clones)):
             members_ok += ok
             members_total += total
+            chats_ok += c_ok
+            chats_total += c_total
             skipped += skip
 
-    lines = [
-        "✅ انتهت الإذاعة",
-        f"• أعضاء السايت وأصحاب البوتات: {main_ok}/{len(main_ids)}",
-    ]
+    lines = ["✅ انتهت الإذاعة"]
+    if do_priv:
+        lines.append(f"• خاص — أعضاء السايت وأصحاب البوتات: {main_ok}/{len(main_ids)}")
+    if do_chats:
+        lines.append(f"• قنوات/جروبات بوتي: {main_chats_ok}/{len(main_chats)}")
     if scope == "all":
-        lines.append(f"• أعضاء البوتات المصنوعة: {members_ok}/{members_total}")
+        if do_priv:
+            lines.append(f"• خاص — أعضاء البوتات المصنوعة: {members_ok}/{members_total}")
+        if do_chats:
+            lines.append(f"• قنوات/جروبات البوتات المصنوعة: {chats_ok}/{chats_total}")
         if skipped:
             lines.append(f"• بوتات متوقفة تم تجاوزها: {skipped}")
     text = "\n".join(lines) + media_note
@@ -624,7 +659,11 @@ async def cl_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state = "✅" if c["bot_id"] in RUNNING else "⛔"
         lines.append(f"{i}) {state} @{c['username']} — المالك {c['owner_id']} — {members} عضو")
     for c in clones[:20]:
-        rows.append([_btn(f"🗑 @{c['username']}", f"cl_kill:{c['bot_id']}")])
+        running = c["bot_id"] in RUNNING
+        rows.append([
+            _btn(("⏸ إيقاف " if running else "▶️ تشغيل ") + f"@{c['username']}", f"cl_pause:{c['bot_id']}"),
+            _btn("🗑", f"cl_kill:{c['bot_id']}"),
+        ])
     if len(clones) > 30:
         lines.append(f"\n… و{len(clones) - 30} بوت آخر.")
     rows.append([_btn("🔙 رجوع", "cl_admin")])
@@ -661,6 +700,7 @@ async def cl_kill_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await stop_clone(clone["bot_id"])
     db.delete_clone(clone["bot_id"])
+    db.log_activity("clone_killed_by_admin", config.OWNER_ID, clone["bot_id"], f"@{clone['username']}")
     await _edit(query, f"🗑 تم حذف @{clone['username']}.",
                 InlineKeyboardMarkup([[_btn("🔙 للقائمة", "cl_list")]]))
     try:
@@ -669,6 +709,30 @@ async def cl_kill_yes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception:
         pass
+
+
+async def cl_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إيقاف/تشغيل بوت مصنوع دون حذف أعضائه وإعداداته."""
+    query = update.callback_query
+    if not await _master_only(update):
+        return
+    clone = db.get_clone(int((query.data or "").partition(":")[2] or 0))
+    if clone is None:
+        await query.answer("البوت غير موجود.", show_alert=True)
+        return
+    if clone["bot_id"] in RUNNING:
+        await stop_clone(clone["bot_id"])
+        db.set_clone_active(clone["bot_id"], False)
+        db.log_activity("clone_paused", config.OWNER_ID, clone["bot_id"], f"@{clone['username']}")
+    else:
+        try:
+            await start_clone(clone["bot_id"], clone["token"], clone["owner_id"])
+            db.set_clone_active(clone["bot_id"], True)
+            db.log_activity("clone_resumed", config.OWNER_ID, clone["bot_id"], f"@{clone['username']}")
+        except Exception:
+            await query.answer("تعذّر التشغيل (التوكن غير صالح؟).", show_alert=True)
+            return
+    await cl_list(update, context)
 
 
 async def cl_tpl(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -709,14 +773,15 @@ async def cl_bc_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not await _master_only(update):
         return
-    scope = (query.data or "").partition(":")[2]
+    _, _, rest = (query.data or "").partition(":")
+    scope, _, where = rest.partition(":")
     pending = context.user_data.pop("cl_bc_msg", None)
-    if pending is None or scope not in {"all", "mine"}:
+    if pending is None or scope not in {"all", "mine"} or where not in {"priv", "chats", "both"}:
         await query.answer("انتهت الجلسة، ابدأ الإذاعة من جديد.", show_alert=True)
         return
     await query.answer()
     await _edit(query, "⏳ بدأت الإذاعة، سيصلك تقرير عند الانتهاء.")
-    context.application.create_task(_cascade_broadcast(context.bot, pending, scope))
+    context.application.create_task(_cascade_broadcast(context.bot, pending, scope, where))
 
 
 # ---------------------------------------------------------------------------
@@ -749,6 +814,16 @@ async def main_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data.pop("cl_expect", None)
         return
 
+    if expect.startswith("ct_"):
+        if await controls.main_input(update, context, expect):
+            context.user_data.pop("cl_expect", None)
+        raise ApplicationHandlerStop
+
+    if expect in ("fs_main", "fs_global"):
+        if await force_sub.main_add_input(update, context, expect.partition("_")[2]):
+            context.user_data.pop("cl_expect", None)
+        raise ApplicationHandlerStop
+
     if expect in ("tpl_welcome", "tpl_ack"):
         name = expect.partition("_")[2]
         if msg.text is None:
@@ -776,23 +851,35 @@ async def main_pending_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         members = sum(
             len(db.clone_user_ids(c["bot_id"], exclude_user_id=c["owner_id"])) for c in clones
         )
+        main_chats = len(db.list_known_chats(0))
+        clone_chats = sum(len(db.list_known_chats(c["bot_id"])) for c in clones)
         context.user_data["cl_bc_msg"] = {
             "chat_id": msg.chat_id, "message_id": msg.message_id, "payload": payload,
         }
         context.user_data.pop("cl_expect", None)
-        rows = []
+        rows = [
+            [_btn(f"👤 بوتي — الخاص فقط ({len(main_ids)})", "cl_bc_send:mine:priv")],
+            [_btn(f"📣 بوتي — القنوات والجروبات فقط ({main_chats})", "cl_bc_send:mine:chats")],
+            [_btn(f"📨 بوتي — الكل ({len(main_ids) + main_chats})", "cl_bc_send:mine:both", "success")],
+        ]
         if payload is not None:
-            rows.append([_btn(f"📨 للكل ({len(main_ids) + members})", "cl_bc_send:all", "success")])
-        rows.append([_btn(f"👥 أعضاء السايت وأصحاب البوتات فقط ({len(main_ids)})", "cl_bc_send:mine")])
+            rows += [
+                [_btn(f"🌍 + بوتات الصانعين — الخاص ({len(main_ids) + members})", "cl_bc_send:all:priv")],
+                [_btn(f"🌍 + بوتات الصانعين — القنوات والجروبات ({main_chats + clone_chats})",
+                      "cl_bc_send:all:chats")],
+                [_btn(f"🌍 + بوتات الصانعين — الكل ({len(main_ids) + members + main_chats + clone_chats})",
+                      "cl_bc_send:all:both", "success")],
+            ]
         rows.append([_btn("❌ إلغاء", "cl_cancel")])
         note = ""
         if payload is None:
-            note = ("\n\n⚠️ هذا النوع من الرسائل يصل فقط لأعضاء السايت وأصحاب البوتات. "
-                    "لأعضاء البوتات المصنوعة أرسل نصاً أو صورة أو فيديو أو ملفاً أو صوتاً.")
+            note = ("\n\n⚠️ هذا النوع من الرسائل يُرسل فقط عبر بوتك الرئيسي. لبوتات الصانعين "
+                    "أرسل نصاً أو صورة أو فيديو أو ملفاً أو صوتاً.")
         await msg.reply_text(
-            "اختر الجمهور:\n"
-            f"• أعضاء السايت وأصحاب البوتات: {len(main_ids)}\n"
-            f"• أعضاء البوتات المصنوعة: {members}" + note,
+            "اختر أين تُرسل الإذاعة:\n"
+            f"• بوتي: خاص {len(main_ids)} | قنوات وجروبات {main_chats}\n"
+            f"• بوتات الصانعين: خاص {members} | قنوات وجروبات {clone_chats}\n"
+            "(القنوات والجروبات = فقط ما يستطيع البوت الكتابة فيه)" + note,
             reply_markup=InlineKeyboardMarkup(rows),
         )
         raise ApplicationHandlerStop
@@ -808,6 +895,12 @@ async def reset_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def register_main_handlers(application):
     """يضاف إلى تطبيق البوت الرئيسي."""
     private = filters.UpdateType.MESSAGE & filters.ChatType.PRIVATE
+    force_sub.set_main_bot(application.bot)
+    controls.register_main_handlers(application)
+    application.add_handler(CallbackQueryHandler(cl_pause, pattern="^cl_pause:"))
+    force_sub.register_chat_tracking(application)
+    application.add_handler(CallbackQueryHandler(force_sub.verify_callback, pattern="^fs_verify$"))
+    application.add_handler(CallbackQueryHandler(force_sub.main_callback, pattern="^cl_fs"))
     application.add_handler(
         CallbackQueryHandler(reset_pending, pattern=r"^(?!cl_)"), group=-2
     )
@@ -859,6 +952,7 @@ def _panel_markup():
         [_btn("✏️ رسالة الترحيب", "o_welcome"), _btn("✏️ رسالة الإرسال", "o_ack")],
         [_btn("🎚 أزرار ولد / أميرة", "o_gender")],
         [_btn("📢 إذاعة", "o_bc", "success"), _btn("📊 إحصائيات", "o_stats")],
+        [_btn("🔒 الاشتراك الإجباري", "o_fs")],
         [_btn("🚫 الحظر وإلغاء الحظر", "o_help")],
     ])
 
@@ -880,6 +974,9 @@ async def clone_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(oid, card, parse_mode=ParseMode.HTML)
         except Exception:
             pass
+
+    if not await force_sub.gate_user(context, user):
+        return
 
     markup = None
     if user.id == oid:
@@ -917,6 +1014,9 @@ async def clone_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if row["is_banned"]:
         await msg.reply_text("أنت محظور من استخدام البوت.")
+        return
+
+    if not await force_sub.gate_user(context, user):
         return
 
     cfg = _gender_cfg(cid)
@@ -1030,7 +1130,24 @@ async def clone_owner_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     data = query.data or ""
     context.user_data.pop("o_expect", None)
 
-    if data == "o_panel":
+    if data == "o_fs" or data.startswith(("o_fs_",)):
+        if data == "o_fs":
+            text, markup = force_sub.clone_menu(cid)
+            await _edit(query, text, markup)
+        else:
+            await force_sub.clone_callback(update, context, cid)
+    elif data.startswith("o_bcs:"):
+        where = data.partition(":")[2]
+        pending = context.user_data.pop("o_bc_msg", None)
+        if pending is None or where not in ("priv", "chats", "both"):
+            await _edit(query, "انتهت الجلسة، ابدأ الإذاعة من جديد.",
+                        InlineKeyboardMarkup([[_btn("🔙 رجوع", "o_panel")]]))
+        else:
+            await _edit(query, "⏳ بدأت الإذاعة، سيصلك تقرير عند الانتهاء.")
+            context.application.create_task(
+                _clone_broadcast(context.bot, cid, oid, pending[0], pending[1], where)
+            )
+    elif data == "o_panel":
         await _edit(query, "🛠 لوحة تحكم بوتك:", _panel_markup())
     elif data in _CALLBACK_TO_EXPECT:
         expect = _CALLBACK_TO_EXPECT[data]
@@ -1053,7 +1170,8 @@ async def clone_owner_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["o_expect"] = "broadcast"
         await _edit(
             query,
-            "📢 أرسل الرسالة التي تريد إذاعتها لأعضاء بوتك (أي نوع: نص، صورة، فيديو...).\n"
+            "📢 أرسل الرسالة التي تريد إذاعتها (أي نوع: نص، صورة، فيديو...).\n"
+            "بعدها تختار: أعضاء بوتك (خاص) أو القنوات والجروبات التي بوتك مشرف فيها أو الاثنين.\n"
             "للإلغاء أرسل «إلغاء».",
             InlineKeyboardMarkup([[_btn("🔙 رجوع", "o_panel")]]),
         )
@@ -1076,15 +1194,25 @@ async def clone_owner_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
-async def _clone_broadcast(bot, cid, owner_id, from_chat, message_id):
-    ids = db.clone_user_ids(cid, exclude_user_id=owner_id)
-    ok = 0
+async def _clone_broadcast(bot, cid, owner_id, from_chat, message_id, where="priv"):
+    ids = db.clone_user_ids(cid, exclude_user_id=owner_id) if where in ("priv", "both") else []
+    chat_ids = db.list_known_chats(cid) if where in ("chats", "both") else []
+    ok = chat_ok = 0
     for uid in ids:
         if await _copy_with_retry(bot, uid, from_chat, message_id):
             ok += 1
         await asyncio.sleep(0.05)
+    for chat_id in chat_ids:
+        if await _copy_with_retry(bot, chat_id, from_chat, message_id):
+            chat_ok += 1
+        await asyncio.sleep(0.05)
+    lines = ["✅ تمت الإذاعة"]
+    if where in ("priv", "both"):
+        lines.append(f"• أعضاء بوتك (خاص): {ok}/{len(ids)}")
+    if where in ("chats", "both"):
+        lines.append(f"• قنوات/جروبات بوتك: {chat_ok}/{len(chat_ids)}")
     try:
-        await bot.send_message(owner_id, f"✅ تمت الإذاعة: وصلت إلى {ok} من {len(ids)} عضو.")
+        await bot.send_message(owner_id, "\n".join(lines))
     except Exception:
         pass
 
@@ -1095,10 +1223,25 @@ async def _owner_expect(update, context, expect):
 
     if expect == "broadcast":
         context.user_data.pop("o_expect", None)
-        await msg.reply_text("⏳ بدأت الإذاعة، سيصلك تقرير عند الانتهاء.")
-        context.application.create_task(
-            _clone_broadcast(context.bot, cid, oid, msg.chat_id, msg.message_id)
+        context.user_data["o_bc_msg"] = (msg.chat_id, msg.message_id)
+        members = len(db.clone_user_ids(cid, exclude_user_id=oid))
+        chats = len(db.list_known_chats(cid))
+        await msg.reply_text(
+            "اختر أين تُرسل الإذاعة:\n"
+            f"• أعضاء بوتك (خاص): {members}\n"
+            f"• قنوات وجروبات بوتك (التي يستطيع الكتابة فيها): {chats}",
+            reply_markup=InlineKeyboardMarkup([
+                [_btn(f"👤 الخاص فقط ({members})", "o_bcs:priv")],
+                [_btn(f"📣 القنوات والجروبات فقط ({chats})", "o_bcs:chats")],
+                [_btn(f"📨 الكل ({members + chats})", "o_bcs:both", "success")],
+                [_btn("❌ إلغاء", "o_panel")],
+            ]),
         )
+        return
+
+    if expect == "fs_add":
+        if await force_sub.clone_add_input(update, context, cid):
+            context.user_data.pop("o_expect", None)
         return
 
     if msg.text is None:
@@ -1234,6 +1377,8 @@ def _build_clone_app(bot_id, token, owner_id):
     app.add_handler(CommandHandler(["admin", "panel"], clone_panel, filters=private & owner))
     app.add_handler(CommandHandler("ban", clone_ban_command, filters=private & owner))
     app.add_handler(CommandHandler("unban", clone_unban_command, filters=private & owner))
+    force_sub.register_chat_tracking(app)
+    app.add_handler(CallbackQueryHandler(force_sub.verify_callback, pattern="^fs_verify$"))
     app.add_handler(CallbackQueryHandler(clone_set_gender, pattern="^set_gender:"))
     app.add_handler(CallbackQueryHandler(clone_owner_callback, pattern="^o_"))
     app.add_handler(MessageHandler(private & owner & plain, clone_owner_message))
