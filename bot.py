@@ -799,13 +799,45 @@ async def send_deleted_media(context, item):
         logger.exception("Could not tell the owner an attachment was unavailable")
 
 
+async def resolve_business_connection(context: ContextTypes.DEFAULT_TYPE, connection_id):
+    """يرجع اتصال Business المحفوظ. إذا لم يوجد (مثلاً فُقدت القاعدة عند إعادة النشر)
+    يسأل تيليجرام عنه مباشرة، ويتأكد أنه حساب المالك، ثم يحفظه من جديد تلقائياً."""
+    connection = get_business_connection(connection_id)
+    if connection is not None:
+        return connection
+    try:
+        remote = await context.bot.get_business_connection(connection_id)
+    except Exception as exc:
+        logger.warning(
+            "Business connection is unknown and could not be fetched: %s", type(exc).__name__
+        )
+        return None
+    remote_user = getattr(remote, "user", None)
+    if remote_user is None or remote_user.id != config.OWNER_ID:
+        logger.warning("Ignoring an unknown Business connection that is not the owner's")
+        return None
+    save_business_connection(remote.id, config.OWNER_ID, bool(remote.is_enabled))
+    logger.warning("Business connection restored automatically from Telegram")
+    try:
+        await context.bot.send_message(
+            chat_id=config.OWNER_ID,
+            text=(
+                "ℹ️ تم استرجاع ربط Telegram Business تلقائياً بعد فقدان سجل الاتصال.\n"
+                "الرسائل التي وصلت قبل هذه اللحظة قد لا تكون محفوظة، وما يصل بعدها يُحفظ طبيعياً."
+            ),
+        )
+    except Exception:
+        pass
+    return get_business_connection(connection_id)
+
+
 async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_edit = update.edited_business_message is not None
     message = update.edited_business_message or update.business_message
     if message is None or not message.business_connection_id:
         return
 
-    connection = get_business_connection(message.business_connection_id)
+    connection = await resolve_business_connection(context, message.business_connection_id)
     if (
         connection is None
         or connection["owner_id"] != config.OWNER_ID
@@ -889,7 +921,7 @@ async def handle_deleted_business_messages(update: Update, context: ContextTypes
     if deleted is None:
         return
 
-    connection = get_business_connection(deleted.business_connection_id)
+    connection = await resolve_business_connection(context, deleted.business_connection_id)
     if (
         connection is None
         or connection["owner_id"] != config.OWNER_ID
@@ -1365,6 +1397,10 @@ async def set_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- تشغيل البوت ---
 
 def main():
+    print(
+        f"قاعدة البيانات: {config.DB_NAME} "
+        f"(موجودة مسبقاً: {'نعم' if Path(config.DB_NAME).exists() else 'لا — ستُنشأ جديدة'})"
+    )
     init_db()
     prune_business_archive()
     application = (
