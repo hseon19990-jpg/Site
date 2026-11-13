@@ -87,6 +87,42 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_business_media_recorded_at "
         "ON business_media_files(recorded_at)"
     )
+    # --- قسم «قم بإنشاء بوت»: البوتات المصنوعة من السايت ---
+    c.execute('''CREATE TABLE IF NOT EXISTS clone_bots (
+        bot_id INTEGER PRIMARY KEY,
+        owner_id INTEGER NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        username TEXT,
+        name TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL
+    )''')
+    # بوت واحد لكل عضو.
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_clone_bots_owner ON clone_bots(owner_id)")
+    c.execute('''CREATE TABLE IF NOT EXISTS clone_users (
+        bot_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        full_name TEXT,
+        username TEXT,
+        messages_count INTEGER NOT NULL DEFAULT 0,
+        is_banned INTEGER NOT NULL DEFAULT 0,
+        gender TEXT,
+        start_notified INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bot_id, user_id)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS clone_settings (
+        bot_id INTEGER NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT,
+        PRIMARY KEY (bot_id, key)
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS clone_message_targets (
+        bot_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        PRIMARY KEY (bot_id, chat_id, message_id)
+    )''')
     # جدول الإعدادات
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -424,3 +460,298 @@ def prune_business_message_metadata(retention_days):
     )
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# البوتات المصنوعة (قسم «قم بإنشاء بوت»)
+# ---------------------------------------------------------------------------
+def _clone_row(row):
+    if row is None:
+        return None
+    return {
+        "bot_id": row[0],
+        "owner_id": row[1],
+        "token": row[2],
+        "username": row[3],
+        "name": row[4],
+        "is_active": bool(row[5]),
+        "created_at": row[6],
+    }
+
+
+_CLONE_COLS = "bot_id, owner_id, token, username, name, is_active, created_at"
+
+
+def save_clone(bot_id, owner_id, token, username, name):
+    """يضيف بوتاً جديداً أو يحدّث توكن بوت موجود مع الإبقاء على أعضائه وإعداداته."""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        conn.execute(
+            "INSERT INTO clone_bots "
+            "(bot_id, owner_id, token, username, name, is_active, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 1, ?) "
+            "ON CONFLICT(bot_id) DO UPDATE SET token = excluded.token, "
+            "username = excluded.username, name = excluded.name, is_active = 1",
+            (bot_id, owner_id, token, username, name, int(time.time())),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_clone(bot_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(f"SELECT {_CLONE_COLS} FROM clone_bots WHERE bot_id = ?", (bot_id,))
+    row = c.fetchone()
+    conn.close()
+    return _clone_row(row)
+
+
+def get_clone_by_owner(owner_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(f"SELECT {_CLONE_COLS} FROM clone_bots WHERE owner_id = ?", (owner_id,))
+    row = c.fetchone()
+    conn.close()
+    return _clone_row(row)
+
+
+def list_clones(active_only=False):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    query = f"SELECT {_CLONE_COLS} FROM clone_bots"
+    if active_only:
+        query += " WHERE is_active = 1"
+    c.execute(query + " ORDER BY created_at")
+    rows = c.fetchall()
+    conn.close()
+    return [_clone_row(r) for r in rows]
+
+
+def set_clone_active(bot_id, is_active):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE clone_bots SET is_active = ? WHERE bot_id = ?",
+        (int(bool(is_active)), bot_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_clone(bot_id):
+    """يحذف البوت وكل أعضائه وإعداداته وروابط رسائله."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    for table in ("clone_users", "clone_settings", "clone_message_targets", "clone_bots"):
+        c.execute(f"DELETE FROM {table} WHERE bot_id = ?", (bot_id,))
+    conn.commit()
+    conn.close()
+
+
+def clone_get_setting(bot_id, key):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT value FROM clone_settings WHERE bot_id = ? AND key = ?",
+        (bot_id, key),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def clone_set_setting(bot_id, key, value):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO clone_settings (bot_id, key, value) VALUES (?, ?, ?)",
+        (bot_id, key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clone_del_setting(bot_id, *keys):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    for key in keys:
+        c.execute(
+            "DELETE FROM clone_settings WHERE bot_id = ? AND key = ?",
+            (bot_id, key),
+        )
+    conn.commit()
+    conn.close()
+
+
+def clone_add_user(bot_id, user_id, full_name, username):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO clone_users (bot_id, user_id, full_name, username) "
+        "VALUES (?, ?, ?, ?)",
+        (bot_id, user_id, full_name, username),
+    )
+    c.execute(
+        "UPDATE clone_users SET full_name = ?, username = ? "
+        "WHERE bot_id = ? AND user_id = ?",
+        (full_name, username, bot_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clone_ensure_user(bot_id, user_id):
+    """ينشئ سجلاً فارغاً لعضو غير معروف (للحظر المسبق بالأيدي) دون مسح بياناته."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO clone_users (bot_id, user_id, full_name) VALUES (?, ?, '')",
+        (bot_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clone_get_user(bot_id, user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT user_id, full_name, username, messages_count, is_banned, gender, "
+        "start_notified FROM clone_users WHERE bot_id = ? AND user_id = ?",
+        (bot_id, user_id),
+    )
+    row = c.fetchone()
+    conn.close()
+    if row is None:
+        return None
+    return {
+        "user_id": row[0],
+        "full_name": row[1],
+        "username": row[2],
+        "messages_count": row[3],
+        "is_banned": bool(row[4]),
+        "gender": row[5],
+        "start_notified": bool(row[6]),
+    }
+
+
+def clone_find_user_by_username(bot_id, username):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT user_id FROM clone_users "
+        "WHERE bot_id = ? AND LOWER(username) = LOWER(?)",
+        (bot_id, (username or "").lstrip("@")),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def clone_mark_start_notified(bot_id, user_id):
+    """يرجع True مرة واحدة فقط عند أول /start لهذا العضو في هذا البوت."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE clone_users SET start_notified = 1 "
+        "WHERE bot_id = ? AND user_id = ? AND start_notified = 0",
+        (bot_id, user_id),
+    )
+    first = c.rowcount == 1
+    conn.commit()
+    conn.close()
+    return first
+
+
+def clone_increment_messages(bot_id, user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE clone_users SET messages_count = messages_count + 1 "
+        "WHERE bot_id = ? AND user_id = ?",
+        (bot_id, user_id),
+    )
+    c.execute(
+        "SELECT messages_count FROM clone_users WHERE bot_id = ? AND user_id = ?",
+        (bot_id, user_id),
+    )
+    row = c.fetchone()
+    conn.commit()
+    conn.close()
+    return row[0] if row else 0
+
+
+def clone_set_gender(bot_id, user_id, gender):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE clone_users SET gender = ? WHERE bot_id = ? AND user_id = ?",
+        (gender, bot_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clone_set_ban(bot_id, user_id, banned):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE clone_users SET is_banned = ? WHERE bot_id = ? AND user_id = ?",
+        (int(bool(banned)), bot_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clone_user_ids(bot_id, exclude_user_id=None):
+    """أعضاء البوت غير المحظورين (للإذاعة)."""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT user_id FROM clone_users WHERE bot_id = ? AND is_banned = 0",
+        (bot_id,),
+    )
+    ids = [row[0] for row in c.fetchall() if row[0] != exclude_user_id]
+    conn.close()
+    return ids
+
+
+def clone_stats(bot_id):
+    """(عدد الأعضاء، عدد المحظورين، مجموع الرسائل)"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT COUNT(*), COALESCE(SUM(is_banned), 0), COALESCE(SUM(messages_count), 0) "
+        "FROM clone_users WHERE bot_id = ?",
+        (bot_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0], row[1], row[2]
+
+
+def clone_save_target(bot_id, chat_id, message_id, user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO clone_message_targets "
+        "(bot_id, chat_id, message_id, user_id) VALUES (?, ?, ?, ?)",
+        (bot_id, chat_id, message_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clone_get_target(bot_id, chat_id, message_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute(
+        "SELECT user_id FROM clone_message_targets "
+        "WHERE bot_id = ? AND chat_id = ? AND message_id = ?",
+        (bot_id, chat_id, message_id),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None

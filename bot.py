@@ -17,6 +17,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 import config
+import clone_bots
 from database import (
     init_db, get_setting, set_setting, add_user, mark_user_start_notified,
     increment_message_count, get_user, set_user_status, get_all_users,
@@ -30,6 +31,9 @@ from database import (
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
+# httpx يطبع روابط الطلبات وفيها توكنات البوتات؛ نخفيها من السجلات.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 BUSINESS_METADATA_RETENTION_DAYS = 30
 BUSINESS_MESSAGE_MAX_CHARS = 3000
 NO_LOCAL_FILE_PREFIX = "file_id:"
@@ -284,16 +288,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_subscribed(update, context):
         return
     
-    reply_markup = None
+    start_rows = []
     if is_owner(update):
-        reply_markup = InlineKeyboardMarkup([[
+        start_rows.append([
             admin_button(
                 "👑 لوحة الإدارة",
                 callback_data="open_admin_panel",
                 icon_key="admin",
             )
-        ]])
-    await send_configured_message(user.id, context, "welcome", reply_markup)
+        ])
+    start_rows.append([
+        InlineKeyboardButton(
+            "🤖 قم بإنشاء بوت", callback_data="cl_create", style="success"
+        )
+    ])
+    await send_configured_message(
+        user.id, context, "welcome", InlineKeyboardMarkup(start_rows)
+    )
     if not is_owner(update) and get_user_gender(user.id) is None:
         await prompt_for_gender(user.id, context)
 
@@ -421,6 +432,7 @@ async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             style="success",
             icon_key="business",
         )],
+        [admin_button("🤖 البوتات المصنوعة", "cl_admin", style="success")],
         [admin_button("📢 إعداد رسالة عامة", "broadcast_setup", icon_key="broadcast")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1370,7 +1382,14 @@ async def set_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     prune_business_archive()
-    application = Application.builder().token(config.BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(config.BOT_TOKEN)
+        .post_init(clone_bots.restore_clones)
+        .post_shutdown(clone_bots.stop_all_clones)
+        .build()
+    )
+    clone_bots.register_main_handlers(application)
     if application.job_queue is not None:
         application.job_queue.run_repeating(
             cleanup_business_message_metadata,
